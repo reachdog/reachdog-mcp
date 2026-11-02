@@ -22,7 +22,7 @@ const session=new Session(new ReachDogClient(url.href,env.REACHDOG_API_KEY??''),
 server.setRequestHandler(ListToolsRequestSchema,()=>({tools}));
 server.setRequestHandler(CallToolRequestSchema,async ({params})=>{
   try {
-    const value=await session.call(params.name,params.arguments??{});
+    const value=await session.call(params.name,params.arguments);
     return {isError:!!(value && 'error' in value && value.error),content:[{type:'text',text:JSON.stringify(value)}]};
   }catch(e){
     const message=e instanceof ApiError?JSON.stringify({status:e.status,error:e.body}):e instanceof Error?e.message:'Tool invocation failed';

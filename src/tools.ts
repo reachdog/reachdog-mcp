@@ -39,7 +39,7 @@ export class Session {
     if(action==='unsupported' && this.budget.limit!==undefined)return 'within pre-approved session cap';
     return action==='declined'?'declined':'preview';
   }
-  async call(name:string,a:Input){
+  async call(name:string,a:Input={}){
     const check=validators.get(name);
     if(!check||!check(a))throw new Error('Invalid '+name+' input: '+ajv.errorsText(check?.errors));
     if(name==='list_parameters')return params;
