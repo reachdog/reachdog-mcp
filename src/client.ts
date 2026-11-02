@@ -23,8 +23,10 @@ const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms
 export class ApiError extends Error {
   readonly status: number;
   readonly body: unknown;
-  constructor(status: number, body: unknown) {
+  readonly ambiguous: boolean;
+  constructor(status: number, body: unknown, ambiguous=false) {
     super(`Reach Dog returned HTTP ${status}`);
+    this.ambiguous = ambiguous;
     this.status = status;
     this.body = body;
   }
@@ -62,7 +64,7 @@ export class ReachDogClient {
     this.#sleep = sleep;
   }
 
-  async #request<T>(path: string, body?: object, key?: string): Promise<Reply<T>> {
+  async #request<T>(path: string, body?: object, key?: string, stopAt=Infinity): Promise<Reply<T>> {
     const headers = new Headers({ Authorization: 'Bearer ' + this.#key, Accept: 'application/json' });
     if (body !== undefined) headers.set('Content-Type', 'application/json');
     if (key !== undefined) {
@@ -70,7 +72,7 @@ export class ReachDogClient {
       headers.set('Idempotency-Key', key);
     }
     const json = JSON.stringify(body);
-    const deadline = Date.now() + 90000;
+    const deadline = Math.min(stopAt, Date.now() + 90000);
     for (let attempt = 0; ; attempt++) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) throw new Error('API request retry deadline exceeded');
@@ -98,7 +100,7 @@ export class ReachDogClient {
       if (!response.ok) {
         let detail: unknown = raw;
         try { detail = JSON.parse(raw); } catch { /* Preserve a non-JSON error body. */ }
-        throw new ApiError(response.status, detail);
+        throw new ApiError(response.status, detail, attempt > 0);
       }
       return { body: JSON.parse(raw) as T, headers: response.headers };
     }
@@ -115,7 +117,7 @@ export class ReachDogClient {
     return this.#request<T>(path, body, key);
   }
 
-  status(id: string) { return this.#request<CatalogStatus>(batchPath(id)); }
+  status(id: string, stopAt=Infinity) { return this.#request<CatalogStatus>(batchPath(id), undefined, undefined, stopAt); }
   accept(id: string, acceptance: string) {
     return this.#request<CatalogStatus>(batchPath(id) + '/accept', { acceptance });
   }

@@ -1,0 +1,36 @@
+[
+  {
+    "payload": {
+      "title": "caf\u00e9 \ud83d\ude00",
+      "parameters": [
+        "brand"
+      ]
+    },
+    "key": "rdt1-title_match-89852cd119c3b43714278766f9e06bec0f09fda6a13c0106d0dc4e0223bd5f18"
+  },
+  {
+    "payload": {
+      "title": "item",
+      "attributes": {
+        "z": "z",
+        "2": "n",
+        "10": "ten",
+        "a": "x"
+      }
+    },
+    "key": "rdt1-title_match-df005c3a1acb2001caf01bb2b9401d176a0081d359ec281b4aa2e55e148d3c3f"
+  },
+  {
+    "payload": {
+      "title": "item",
+      "language": "en"
+    },
+    "key": "rdt1-title_match-3d6df607645f52e73cca26173a1377aedafecb04e107037169f3c633b6b4b13e"
+  },
+  {
+    "payload": {
+      "title": "item"
+    },
+    "key": "rdt1-title_match-d5a5a6a14e1433aedb88300cd0850b6371331e3db7340fe919a1758d9b1c9557"
+  }
+]
