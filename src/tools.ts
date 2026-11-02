@@ -28,6 +28,12 @@ const validators=new Map(tools.map(t=>[t.name,ajv.compile(t.inputSchema)]));
 type Input={body?:any;parameters?:string[];confirm?:boolean;run_label?:string;batch_id?:string;acceptance?:string};
 type Approval=(message:string)=>Promise<'accepted'|'declined'|'unsupported'>;
 export class Session {
+  private catalogBusy = new Set<string>();
+  private async onBatch<T>(id:string, run:()=>Promise<T>) {
+    if(this.catalogBusy.has(id)) throw new Error('Batch operation in progress; resume with get_catalog_status');
+    this.catalogBusy.add(id);
+    try {return await run();} finally {this.catalogBusy.delete(id);}
+  }
   private quotes=new Map<string,string>();
   private accepted=new Map<string,string>();
   constructor(private client:ReachDogClient,private host:string,private account:string,private budget:Budget,
@@ -44,8 +50,8 @@ export class Session {
     if(!check||!check(a))throw new Error('Invalid '+name+' input: '+ajv.errorsText(check?.errors));
     if(name==='list_parameters')return params;
     if(name==='get_usage')return (await this.client.usage()).body;
-    if(name==='get_catalog_status')return this.status(a.batch_id!);
-    if(name==='enrich_catalog'||name==='retry_payment')return this.catalog(name,a);
+    if(name==='get_catalog_status')return this.onBatch(a.batch_id!,()=>this.status(a.batch_id!));
+    if(name==='enrich_catalog'||name==='retry_payment')return a.batch_id ? this.onBatch(a.batch_id,()=>this.catalog(name,a)) : this.catalog(name,a);
     const op=single[name as keyof typeof single];
     const requested=a.parameters??a.body.parameters;
     const names=requested.map((x:string|number)=>typeof x==='number'?params.REGISTER[String(x) as keyof typeof params.REGISTER]:x);
@@ -80,7 +86,7 @@ export class Session {
       if(a.body.parameters.some((p:string)=>!params.CATALOG.includes(p)))throw new Error('Unsupported catalog output');
       const key=requestKey(this.host,this.account,'catalog',a.body,a.run_label);
       const s=(await this.client.submit(a.body as CatalogRequest,key)).body;
-      return s.status==='awaiting_acceptance'?this.display(s):this.status(s.id);
+      return s.status==='awaiting_acceptance'?this.display(s):this.onBatch(s.id,()=>this.status(s.id));
     }
     if(!a.batch_id)throw new Error('Missing batch_id');
     const s=(await this.client.status(a.batch_id)).body;
