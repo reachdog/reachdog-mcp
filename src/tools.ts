@@ -66,7 +66,7 @@ export class Session {
     const key=requestKey(this.host,this.account,op[0],a.body,a.run_label);
     const approval=await this.mode(a.confirm,{operation:name,body:a.body,...estimate});
     if(approval==='preview'||approval==='declined')return {...estimate,approval};
-    return this.budget.run(key,estimate.estimated_tokens,async()=>{
+    return this.budget.runPaidPost(key,estimate.estimated_tokens,async()=>{
       const response=await this.client[op[3]](a.body as TitleRequest & ResearchRequest & ContentRequest,key);
       const state=response.headers.get('x-charge-state'), value=response.headers.get('x-charged-tokens');
       const charged=state==='settled'&&value!==null&&/^\d+$/.test(value)?Number(value):null;
@@ -102,11 +102,11 @@ export class Session {
     const cost=amount((quote as {amount?:number})?.amount);
     const approval=await this.mode(a.confirm,{operation:name,batch_id:s.id,quote});
     if(approval==='preview'||approval==='declined')return {...this.display(s),approval};
-    return this.budget.run(s.id,cost,async()=>{
+    await this.budget.runPaidPost(s.id,cost,async()=>{
       this.accepted.set(s.id,binding);
       await (retry?this.client.retryPayment(s.id,String(acceptance)):this.client.accept(s.id,String(acceptance)));
-      return {approval,quote,...await this.status(s.id)};
     });
+    return {approval,quote,...await this.status(s.id)};
   }
   private retryable(s:CatalogStatus){return s.billing.state==='refused' && ['insufficient_credits','wallet_frozen'].includes(String(s.error?.code));}
   private async status(id:string){

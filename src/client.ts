@@ -48,27 +48,28 @@ function batchPath(id: string) {
 
 export class ReachDogClient {
   readonly #base: URL;
-  readonly #key: string;
+  readonly #headers: Headers;
   readonly #fetch: typeof fetch;
   readonly #sleep: typeof wait;
 
   constructor(base: string, key: string, transport = fetch, sleep = wait) {
     this.#base = new URL(base);
-    if (this.#base.username || this.#base.password || !key.trim()) throw new Error('Invalid API configuration');
+    if (!key || /[^\x21-\x7e]/.test(key)) throw new Error('Invalid Reach Dog API key');
+    if (this.#base.username || this.#base.password) throw new Error('Invalid API configuration');
     if (this.#base.protocol !== 'https:' && !(this.#base.protocol === 'http:' &&
       ['127.0.0.1', 'localhost', '[::1]'].includes(this.#base.hostname))) {
       throw new Error('Use HTTPS or a loopback test server');
     }
-    this.#key = key;
+    this.#headers = new Headers({ Authorization: 'Bearer ' + key, Accept: 'application/json' });
     this.#fetch = transport;
     this.#sleep = sleep;
   }
 
   async #request<T>(path: string, body?: object, key?: string, stopAt=Infinity): Promise<Reply<T>> {
-    const headers = new Headers({ Authorization: 'Bearer ' + this.#key, Accept: 'application/json' });
+    const headers = new Headers(this.#headers);
     if (body !== undefined) headers.set('Content-Type', 'application/json');
     if (key !== undefined) {
-      if (!key.trim() || key.length > 200) throw new Error('Invalid Idempotency-Key');
+      if (!key.trim() || key.length > 200 || /[^\x20-\x7e]/.test(key)) throw new Error('Invalid Idempotency-Key');
       headers.set('Idempotency-Key', key);
     }
     const json = JSON.stringify(body);

@@ -25,7 +25,7 @@ server.setRequestHandler(CallToolRequestSchema,async ({params})=>{
     const value=await session.call(params.name,params.arguments);
     return {isError:!!(value && 'error' in value && value.error),content:[{type:'text',text:JSON.stringify(value)}]};
   }catch(e){
-    const message=e instanceof ApiError?JSON.stringify({status:e.status,error:e.body}):e instanceof Error?e.message:'Tool invocation failed';
+    const message=e instanceof ApiError?JSON.stringify({status:e.status,error:e.body}):e instanceof Error && !(e instanceof TypeError)?e.message:'Tool invocation failed';
     return {isError:true,content:[{type:'text',text:message}]};
   }
 });

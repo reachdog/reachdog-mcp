@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { ApiError } from '../dist/client.js';
 import { Session } from '../dist/tools.js';
 import { Budget } from '../dist/budget.js';
 import { requestKey } from '../dist/identity.js';
@@ -81,4 +83,74 @@ test('a real stdio client lists tools and previews with a mock HTTP API',async()
   const result=await client.callTool({name:'enrich_title',arguments:{body:title}});
   assert.equal(JSON.parse(result.content[0].text).estimated_tokens,2);
  }finally{await client.close();await new Promise(r=>api.close(r));}
+});
+
+test('invalid API key stops stdio startup without disclosing credentials', () => {
+ const key = 'sentinel-secret-left\r\nsentinel-secret-right';
+ const {status,stdout,stderr} = spawnSync(process.execPath,['dist/server.js'],{
+  env:{...process.env,REACHDOG_API_KEY:key,REACHDOG_API_URL:'https://api.test',REACHDOG_ACCOUNT_LABEL:'offline'},
+  input:'',encoding:'utf8',timeout:10000
+ });
+ assert.equal(status,1);
+ assert.match(stderr,/Invalid Reach Dog API key/);
+ assert.equal(stdout,'');
+ assert.doesNotMatch(stderr,/sentinel-secret/);
+});
+
+for (const phase of ['status','results']) {
+ test('committed catalog quote survives 403 on '+phase, async () => {
+  const {session,api,status,calls}=setup({cap:6});
+  await session.call('enrich_catalog',quote);
+  if (phase==='status') {
+   const read=api.status;
+   api.status=async()=>status.status==='running' ? Promise.reject(new ApiError(403,{})) : read();
+  } else {
+   api.accept=async()=>{
+    calls.push('accept');
+    Object.assign(status,{status:'completed',result_available:true});
+    status.billing.state='settled';
+   };
+   api.results=async()=>{throw new ApiError(403,{});};
+  }
+  await assert.rejects(session.call('enrich_catalog',accept),{status:403});
+  assert.deepEqual(calls,['accept']);
+  await session.call('enrich_title',{body:title,confirm:true});
+  await assert.rejects(session.call('enrich_title',{body:title,confirm:true,run_label:'extra'}),/budget/);
+  assert.equal(calls.length,2);
+ });
+}
+
+test('same batch status is excluded while the accept POST is pending', async () => {
+ const {session,api}=setup({cap:4});
+ const entered=Promise.withResolvers(), release=Promise.withResolvers();
+ const send=api.accept;
+ api.accept=async()=>{entered.resolve();await release.promise;await send();};
+ await session.call('enrich_catalog',quote);
+ const paying=session.call('enrich_catalog',accept);
+ try {
+  await entered.promise;
+  await assert.rejects(session.call('get_catalog_status',{batch_id:'job'}),/Batch operation in progress/);
+ } finally {release.resolve();await paying;}
+});
+
+test('settled title receipt replaces its estimate for later admissions', async () => {
+ const {session,calls}=setup({cap:5,price:3});
+ for (const run_label of ['first','second'])
+  assert.equal((await session.call('enrich_title',{body:title,confirm:true,run_label})).charged_tokens,2);
+ await assert.rejects(session.call('enrich_title',{body:title,confirm:true,run_label:'third'}),/budget/);
+ assert.equal(calls.length,2);
+});
+
+test('retry-payment POST commits the quote before the next status read', async () => {
+ const {session,api,status,calls}=setup({cap:4});
+ await session.call('enrich_catalog',quote);
+ await session.call('enrich_catalog',accept);
+ Object.assign(status,{status:'failed',error:{code:'wallet_frozen'}});
+ status.billing.state='refused';
+ await session.call('get_catalog_status',{batch_id:'job'});
+ const read=api.status;
+ api.status=async()=>calls.includes('retry') ? Promise.reject(new ApiError(403,{})) : read();
+ await assert.rejects(session.call('retry_payment',{batch_id:'job',confirm:true}),{status:403});
+ assert.deepEqual(calls,['accept','retry']);
+ await assert.rejects(session.call('enrich_title',{body:title,confirm:true}),/budget/);
 });
