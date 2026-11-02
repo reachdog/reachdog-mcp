@@ -1,0 +1,15 @@
+{
+  "name": "io.github.reachdog/reachdog-mcp",
+  "description": "Reach Dog catalog and title enrichment tools.",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@reachdog/mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
