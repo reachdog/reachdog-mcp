@@ -9,7 +9,41 @@
       "version": "0.1.0",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "environmentVariables": [
+        {
+          "name": "REACHDOG_API_URL",
+          "description": "Reach Dog API origin.",
+          "format": "string",
+          "isRequired": true,
+          "default": "https://api.reach.dog"
+        },
+        {
+          "name": "REACHDOG_API_KEY",
+          "description": "Your API key from https://platform.reach.dog/keys.",
+          "format": "string",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "REACHDOG_ACCOUNT_LABEL",
+          "description": "A stable, non-secret account label for request identity.",
+          "format": "string",
+          "isRequired": true,
+          "default": "my-application"
+        },
+        {
+          "name": "REACHDOG_MAX_TOKENS_PER_SESSION",
+          "description": "Optional whole-number spending cap in Reach Dog billing tokens. In clients without approval dialogs, this cap authorizes spending within the limit.",
+          "format": "number",
+          "isRequired": false
+        }
+      ]
     }
-  ]
+  ],
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "repository": {
+    "url": "https://github.com/reachdog/reachdog-mcp",
+    "source": "github"
+  }
 }
