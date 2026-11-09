@@ -2,7 +2,6 @@
   "name": "@reachdog/mcp",
   "version": "0.1.0",
   "type": "module",
-  "private": true,
   "bin": {
     "reachdog-mcp": "dist/server.js"
   },
@@ -26,5 +25,25 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "~5.9.3"
+  },
+  "description": "Product, catalog, market research and content tools for the Reach Dog API.",
+  "license": "MIT",
+  "mcpName": "io.github.reachdog/reachdog-mcp",
+  "homepage": "https://reach.dog/developers",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/reachdog/reachdog-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/reachdog/reachdog-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "commerce",
+    "catalog",
+    "reachdog"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }
