@@ -9,7 +9,8 @@ export type CodeKind = 'pending' | 'code';
 export interface CodeRecord {
   client_id: string;
   grant_id: string;
-  grant_secret: string;
+  /** Opaque value sealed by the caller. The store never sees a raw grant secret. */
+  sealed_secret: string;
   challenge: string;
   redirect_uri: string;
   resource?: string;
@@ -29,6 +30,7 @@ export function utcDay(now: Date = new Date()): string {
 
 /** MongoDB-backed state shared by every Cloud Run instance of the hosted connector. */
 export class HostedStore {
+  private readonly busy = new Set<string>();
   constructor(private readonly db: Db) {}
 
   private col(name: string) { return this.db.collection<Document>(name); }
@@ -100,27 +102,28 @@ export class HostedStore {
   }
 
   spend(grant_id: string, daily_limit: number, day: string = utcDay()): Spend {
-    return new MongoSpend(this.col('mcp_spend'), `${grant_id}:${day}`, amount(daily_limit));
+    return new MongoSpend(this.col('mcp_spend'), `${grant_id}:${day}`, amount(daily_limit), this.busy);
   }
 }
 
 class MongoSpend implements Spend {
-  private busy = new Set<string>();
   constructor(
     private readonly col: ReturnType<Db['collection']>,
     private readonly docId: string,
     readonly limit: number,
+    private readonly busy: Set<string>,
   ) {}
 
-  private async refuse(): Promise<never> {
+  private async refuse(k?: string): Promise<never> {
     const d = await this.col.findOne({ _id: this.docId as any });
-    const left = Math.max(0, this.limit - ((d?.total as number | undefined) ?? 0));
+    const own = k ? ((d?.ops as Record<string, number> | undefined)?.[k] ?? 0) : 0;
+    const left = Math.max(0, this.limit - (((d?.total as number | undefined) ?? 0) - own));
     throw new Error(`Daily limit reached: ${left} of ${this.limit} Reach Dog tokens left today`);
   }
 
   /** Returns the prior reservation (undefined if none). Throws when over the limit. */
   private async reserve(k: string, estimate: number): Promise<number | undefined> {
-    if (estimate > this.limit) return this.refuse();
+    if (estimate > this.limit) return this.refuse(k);
     const prior = { $ifNull: [`$ops.${k}`, 0] };
     const next = { $max: [prior, estimate] };
     const newTotal = { $add: [{ $subtract: [{ $ifNull: ['$total', 0] }, prior] }, next] };
@@ -130,7 +133,7 @@ class MongoSpend implements Spend {
       { _id: this.docId as any, $expr: { $lte: [newTotal, this.limit] } },
       [{ $set: { total: newTotal, [`ops.${k}`]: next } }],
       { returnDocument: 'before' });
-    if (!before) return this.refuse();
+    if (!before) return this.refuse(k);
     return (before.ops as Record<string, number> | undefined)?.[k];
   }
 
@@ -150,9 +153,10 @@ class MongoSpend implements Spend {
   }
 
   async runPaidPost<T>(id: string, estimate: number, post: () => Promise<T>): Promise<T> {
-    if (this.busy.has(id)) throw new Error('Operation already in progress');
+    const bk = `${this.docId}:${id}`;
+    if (this.busy.has(bk)) throw new Error('Operation already in progress');
     const k = sha(id).slice(0, 32);
-    this.busy.add(id);
+    this.busy.add(bk);
     try {
       const prior = await this.reserve(k, amount(estimate));
       try { return await post(); }
@@ -161,7 +165,7 @@ class MongoSpend implements Spend {
           await this.release(k);
         throw e;
       }
-    } finally { this.busy.delete(id); }
+    } finally { this.busy.delete(bk); }
   }
 
   async settle(id: string, x: unknown): Promise<void> {

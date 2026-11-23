@@ -13,7 +13,7 @@ before(async () => {
 after(async () => { await client?.close(); await mongod?.stop(); });
 const fresh = () => { db = client.db('t' + (n++)); return new HostedStore(db); };
 const codeDoc = (over = {}) => ({
-  client_id: 'c1', grant_id: 'g1', grant_secret: 's', challenge: 'ch',
+  client_id: 'c1', grant_id: 'g1', sealed_secret: 'opaque-sealed', challenge: 'ch',
   redirect_uri: 'http://127.0.0.1:1/cb', resource: 'https://x/mcp',
   expires: new Date(Date.now() + 60_000), ...over,
 });
@@ -118,4 +118,29 @@ test('ensureIndexes creates TTL indexes', async () => {
   await s.ensureIndexes();
   const idx = await db.collection('mcp_oauth_refresh').indexes();
   assert.ok(idx.some(i => i.expireAfterSeconds === 30 * 86400));
+});
+
+test('persisted code doc holds no grant secret value', async () => {
+  const s = fresh();
+  await s.putCode('c', 'code', codeDoc());
+  const raw = JSON.stringify(await db.collection('mcp_oauth_codes').find().toArray());
+  assert.ok(!raw.includes('grant_secret'));
+  assert.ok(raw.includes('opaque-sealed'));
+});
+
+test('two Spend objects from one store cannot run the same id concurrently', async () => {
+  const s = fresh();
+  let release;
+  const p = s.spend('g', 10000, '2026-01-01').runPaidPost('same', 10, () => new Promise(r => { release = r; }));
+  await new Promise(r => setTimeout(r, 30));
+  await assert.rejects(s.spend('g', 10000, '2026-01-01').runPaidPost('same', 10, async () => 1), /already in progress/);
+  release(1); await p;
+});
+
+test('refusal reports remaining excluding own prior reservation', async () => {
+  const s = fresh();
+  const sp = s.spend('g', 10000, '2026-01-01');
+  await sp.runPaidPost('big', 9000, async () => 1);
+  await assert.rejects(sp.runPaidPost('other', 2000, async () => 1), /1000 of 10000/);
+  await assert.rejects(sp.runPaidPost('big', 11000, async () => 1), /10000 of 10000/);
 });

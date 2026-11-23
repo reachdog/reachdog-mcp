@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { seal, open } from '../dist/hosted/seal.js';
+import { seal, open, sealValue, openValue } from '../dist/hosted/seal.js';
 
 const key = randomBytes(32);
 const now = 1_700_000_000_000;
@@ -98,4 +98,13 @@ test('truncated tokens return null', () => {
   const raw = Buffer.from(seal('access', payload, key), 'base64url');
   assert.equal(open('access', raw.subarray(0, raw.length - 1).toString('base64url'), key, now), null);
   assert.equal(open('access', raw.subarray(0, raw.length - 16).toString('base64url'), key, now), null);
+});
+
+test('sealValue/openValue round trip, wrong label and tamper', () => {
+  const t = sealValue('code', 'hello secret', key);
+  assert.equal(openValue('code', t, key), 'hello secret');
+  assert.equal(openValue('other', t, key), null);
+  const bad = t.slice(0, -2) + (t.endsWith('AA') ? 'BB' : 'AA');
+  assert.equal(openValue('code', bad, key), null);
+  assert.equal(openValue('code', 'x', key), null);
 });
