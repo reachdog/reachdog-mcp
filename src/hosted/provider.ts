@@ -5,7 +5,6 @@
 // and grant secrets must never reach a log line.
 
 import { randomBytes } from 'node:crypto';
-import { isIP } from 'node:net';
 import type { AuthorizationParams, OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
@@ -19,6 +18,9 @@ import type { HostedStore, PendingRecord } from './store.ts';
 import { open, openValue, seal, sealValue, type SealKind, type SealPayload } from './seal.ts';
 import { ReconnectError, type AccountsClient, type CreatedGrant } from './accounts.ts';
 import { allowedRedirect } from './redirects.ts';
+import {
+  pinnedGet, publicHostName, systemResolver, vetHost, type DocumentGetter, type Resolver,
+} from './cimd-fetch.ts';
 
 type AuthorizeResponse = Parameters<OAuthServerProvider['authorize']>[2];
 
@@ -37,7 +39,10 @@ export interface ProviderOptions {
   sealKey: Buffer;
   publicUrl?: string;
   accountsOrigin?: string;
-  fetch?: typeof fetch;
+  /** DNS resolver for metadata-document hosts (tests inject one). */
+  resolve?: Resolver;
+  /** Fetches a metadata document pinned to a vetted address (tests inject one). */
+  getDocument?: DocumentGetter;
   now?: () => number;
 }
 
@@ -47,19 +52,13 @@ const CODE_TTL_MS = 10 * 60_000;
 const CIMD_FRESH_MS = 86400_000;
 const CIMD_TIMEOUT_MS = 2000;
 const CIMD_MAX_BYTES = 5 * 1024;
+const CIMD_NEGATIVE_MS = 5 * 60_000;
+const CIMD_NEGATIVE_MAX = 1000;
 const NAME_MAX = 80;
 const SCOPES = ['reachdog'];
 
 const randomId = (): string => randomBytes(32).toString('base64url');
 const trimSlash = (s: string): string => s.replace(/\/+$/, '');
-
-/** Hosts a Client ID Metadata Document may never live on: IP literals and internal names. */
-function publicHost(host: string): boolean {
-  const h = host.toLowerCase().replace(/^\[|\]$/g, '');
-  if (isIP(h) !== 0) return false;
-  if (!h.includes('.') || h === 'localhost') return false;
-  return !['.localhost', '.internal', '.local', '.home.arpa'].some(s => h.endsWith(s));
-}
 
 /** Parses a CIMD client_id. Null unless it is a plain https URL with a path on a public host. */
 function cimdUrl(id: string): URL | null {
@@ -67,24 +66,7 @@ function cimdUrl(id: string): URL | null {
   let u: URL;
   try { u = new URL(id); } catch { return null; }
   if (u.protocol !== 'https:' || u.username || u.password || u.pathname === '/' || u.pathname === '') return null;
-  return publicHost(u.hostname) ? u : null;
-}
-
-async function readCapped(res: Response, cap: number): Promise<string | null> {
-  const declared = Number(res.headers.get('content-length'));
-  if (Number.isFinite(declared) && declared > cap) return null;
-  if (!res.body) return null;
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > cap) { await reader.cancel().catch(() => undefined); return null; }
-    chunks.push(value);
-  }
-  return Buffer.concat(chunks).toString('utf8');
+  return publicHostName(u.hostname) ? u : null;
 }
 
 function displayName(name: unknown, redirectUri: string): string {
@@ -95,9 +77,13 @@ function displayName(name: unknown, redirectUri: string): string {
 }
 
 class ClientsStore implements OAuthRegisteredClientsStore {
+  /** Metadata-document ids that recently failed, so they cannot trigger a fetch on every request. */
+  private readonly failed = new Map<string, number>();
+
   constructor(
     private readonly store: HostedStore,
-    private readonly fetchImpl: typeof fetch,
+    private readonly resolve: Resolver,
+    private readonly getDocument: DocumentGetter,
     private readonly now: () => number,
   ) {}
 
@@ -130,17 +116,22 @@ class ClientsStore implements OAuthRegisteredClientsStore {
     if (cached && typeof cached.cached_at === 'number' && this.now() - cached.cached_at < CIMD_FRESH_MS) {
       return onlyAllowed(cached);
     }
+    const until = this.failed.get(id);
+    if (until !== undefined && until > this.now()) return undefined;
+    const info = await this.fetchMetadata(url, id);
+    if (info) { this.failed.delete(id); return info; }
+    this.failed.delete(id);
+    if (this.failed.size >= CIMD_NEGATIVE_MAX) this.failed.delete(this.failed.keys().next().value as string);
+    this.failed.set(id, this.now() + CIMD_NEGATIVE_MS);
+    return undefined;
+  }
+
+  private async fetchMetadata(url: URL, id: string): Promise<OAuthClientInformationFull | undefined> {
+    const addr = await vetHost(url.hostname, this.resolve);
+    if (!addr) return undefined;
     let text: string | null;
-    try {
-      const res = await this.fetchImpl(url.href, {
-        redirect: 'error', signal: AbortSignal.timeout(CIMD_TIMEOUT_MS), headers: { Accept: 'application/json' },
-      });
-      if (res.status !== 200) return undefined;
-      text = await readCapped(res, CIMD_MAX_BYTES);
-    } catch {
-      return undefined;
-    }
-    if (text === null) return undefined;
+    try { text = await this.getDocument(url, addr); } catch { return undefined; }
+    if (text === null || Buffer.byteLength(text) > CIMD_MAX_BYTES) return undefined;
     let doc: unknown;
     try { doc = JSON.parse(text); } catch { return undefined; }
     if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) return undefined;
@@ -185,7 +176,9 @@ export class ReachDogOAuthProvider implements OAuthServerProvider {
     this.#now = opts.now ?? Date.now;
     this.issuer = new URL(this.#publicUrl).href;
     this.resource = new URL(this.#publicUrl + '/mcp');
-    this.clientsStore = new ClientsStore(this.#store, opts.fetch ?? fetch, this.#now);
+    const getDocument: DocumentGetter = opts.getDocument
+      ?? ((url, addr) => pinnedGet(url, addr, { timeoutMs: CIMD_TIMEOUT_MS, maxBytes: CIMD_MAX_BYTES }));
+    this.clientsStore = new ClientsStore(this.#store, opts.resolve ?? systemResolver, getDocument, this.#now);
   }
 
   // ---- authorize and the consent hand-off (Task C6 uses peekPending/issueCode/denyRequest) ----

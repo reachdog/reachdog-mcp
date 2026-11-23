@@ -14,6 +14,9 @@ import { AccountsClient } from '../dist/hosted/accounts.js';
 import { seal } from '../dist/hosted/seal.js';
 import { ReachDogOAuthProvider } from '../dist/hosted/provider.js';
 import { allowedRedirect, CLIENT_CALLBACKS } from '../dist/hosted/redirects.js';
+import { isPublicAddress, pinnedGet, publicHostName, vetHost } from '../dist/hosted/cimd-fetch.js';
+import { createServer } from 'node:https';
+import { readFileSync } from 'node:fs';
 
 const KEY = randomBytes(32);
 const RESOURCE = 'https://mcp.reach.dog/mcp';
@@ -43,19 +46,24 @@ function setup(opts = {}) {
   const acc = fakeAccounts();
   let clock = Date.now();
   const fetches = [];
+  const lookups = [];
   const docs = opts.docs ?? {};
-  const fetchImpl = async (url, init) => {
-    fetches.push({ url: String(url), init });
-    const d = docs[String(url)];
-    if (!d) return new Response('nope', { status: 404 });
-    if (typeof d === 'function') return d();
-    return new Response(typeof d === 'string' ? d : JSON.stringify(d),
-      { status: 200, headers: { 'content-type': 'application/json' } });
+  const dns = opts.dns ?? {};
+  const resolve = async host => {
+    lookups.push(host);
+    if (dns[host]) return dns[host];
+    return [{ address: '93.184.215.14', family: 4 }];
+  };
+  const getDocument = async (url, addr) => {
+    fetches.push({ url: url.href, addr });
+    const d = docs[url.href];
+    if (d === undefined) return null;
+    return typeof d === 'string' ? d : JSON.stringify(d);
   };
   const provider = new ReachDogOAuthProvider({
-    store, accounts: acc.client, sealKey: KEY, fetch: fetchImpl, now: () => clock,
+    store, accounts: acc.client, sealKey: KEY, resolve, getDocument, now: () => clock,
   });
-  return { store, provider, acc, fetches, advance: ms => { clock += ms; }, now: () => clock };
+  return { store, provider, acc, fetches, lookups, advance: ms => { clock += ms; }, now: () => clock };
 }
 
 const fakeRes = () => {
@@ -297,6 +305,14 @@ test('refresh rotates with a new jti; the old one no longer works on its own', a
   assert.equal(ctx.acc.calls.length, 0);
 });
 
+test('an access token is never accepted as a refresh token', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const t = await tokens(ctx, c);
+  await assert.rejects(ctx.provider.exchangeRefreshToken(c, t.access_token), InvalidGrantError);
+  assert.equal(ctx.acc.calls.length, 0);
+});
+
 test('refresh replay revokes the whole grant in Accounts', async () => {
   const ctx = setup();
   const c = await registered(ctx.provider);
@@ -392,8 +408,7 @@ test('CIMD document is fetched safely, validated and cached for a day', async ()
   assert.equal(c.client_name, 'Meta App');
   assert.equal(c.client_secret, undefined);
   assert.equal(ctx.fetches.length, 1);
-  assert.equal(ctx.fetches[0].init.redirect, 'error');
-  assert.ok(ctx.fetches[0].init.signal instanceof AbortSignal);
+  assert.deepEqual(ctx.fetches[0].addr, { address: '93.184.215.14', family: 4 }); // pinned to the vetted address
   await ctx.provider.clientsStore.getClient(CIMD);
   assert.equal(ctx.fetches.length, 1); // cached
   ctx.advance(86400 * 1000 + 1);
@@ -421,10 +436,103 @@ test('CIMD refuses non-https, private hosts, oversize and non-JSON documents', a
   for (const id of ['http://client.example/c.json', 'https://127.0.0.1/c.json', 'https://localhost/c.json',
     'https://10.1.2.3/c.json', 'https://192.168.0.1/c.json', 'https://169.254.169.254/c.json', 'https://[::1]/c.json',
     'https://metadata.google.internal/c.json', 'https://foo.localhost/c.json', 'https://intranet/c.json',
-    'https://user@client.example/c.json', 'https://client.example/'])
+    'https://user@client.example/c.json', 'https://client.example/', 'https://localhost./c.json',
+    'https://metadata.google.internal./x', 'https://foo.localhost./x', 'https://intranet./x', 'https://a.local../x'])
     assert.equal(await ctx.provider.clientsStore.getClient(id), undefined, id);
   assert.equal(ctx.fetches.length, 0);
+  assert.equal(ctx.lookups.length, 0);
   assert.equal(await ctx.provider.clientsStore.getClient(big), undefined);
   assert.equal(await ctx.provider.clientsStore.getClient(txt), undefined);
   assert.equal(await ctx.provider.clientsStore.getClient('https://missing.example/c.json'), undefined);
+});
+
+test('CIMD host must resolve only to public addresses', async () => {
+  const ids = {
+    priv: 'https://priv.example/c.json', mixed: 'https://mixed.example/c.json', mapped: 'https://mapped.example/c.json',
+    v6: 'https://v6.example/c.json', ok: 'https://ok.example/c.json', nip: 'https://127.0.0.1.nip.io/c.json',
+  };
+  const docs = Object.fromEntries(Object.values(ids).map(id => [id, { ...cimdDoc(), client_id: id }]));
+  const ctx = setup({ docs, dns: {
+    'priv.example': [{ address: '10.0.0.5', family: 4 }],
+    'mixed.example': [{ address: '93.184.215.14', family: 4 }, { address: '192.168.1.9', family: 4 }],
+    'mapped.example': [{ address: '::ffff:10.0.0.1', family: 6 }],
+    'v6.example': [{ address: 'fd00::1', family: 6 }],
+    '127.0.0.1.nip.io': [{ address: '127.0.0.1', family: 4 }],
+    'ok.example': [{ address: '2606:2800:21f:cb07:6820:80da:af6b:8b2c', family: 6 }],
+  } });
+  for (const k of ['priv', 'mixed', 'mapped', 'v6', 'nip'])
+    assert.equal(await ctx.provider.clientsStore.getClient(ids[k]), undefined, k);
+  assert.equal(ctx.fetches.length, 0);
+  const ok = await ctx.provider.clientsStore.getClient(ids.ok);
+  assert.equal(ok.client_id, ids.ok);
+  assert.deepEqual(ctx.fetches[0].addr, { address: '2606:2800:21f:cb07:6820:80da:af6b:8b2c', family: 6 });
+});
+
+test('address classification', async () => {
+  for (const a of ['10.0.0.5', '127.0.0.1', '172.16.0.1', '172.31.255.255', '192.168.0.1', '169.254.169.254',
+    '100.64.0.1', '0.0.0.0', '224.0.0.1', '255.255.255.255', '::', '::1', 'fe80::1', 'fc00::1', 'fd12::1', 'ff02::1',
+    '::ffff:10.0.0.1', '::ffff:8.8.8.8', '64:ff9b::a00:1', 'not-an-ip'])
+    assert.equal(isPublicAddress(a), false, a);
+  for (const a of ['8.8.8.8', '93.184.215.14', '172.32.0.1', '100.128.0.1', '2606:4700::1111'])
+    assert.equal(isPublicAddress(a), true, a);
+  for (const h of ['localhost.', 'metadata.google.internal.', 'foo.localhost.', 'intranet.', 'a.local..', '127.0.0.1.',
+    '[::1]', 'x.home.arpa.'])
+    assert.equal(publicHostName(h), false, h);
+  assert.equal(publicHostName('client.example.'), true);
+  assert.equal(await vetHost('localhost.', async () => [{ address: '8.8.8.8', family: 4 }]), null);
+  assert.equal(await vetHost('ok.example', async () => []), null);
+  assert.equal(await vetHost('ok.example', async () => { throw new Error('nxdomain'); }), null);
+  assert.deepEqual(await vetHost('OK.example.', async h => { assert.equal(h, 'ok.example'); return [{ address: '8.8.8.8', family: 4 }]; }),
+    { address: '8.8.8.8', family: 4 });
+});
+
+test('failed CIMD lookups are negatively cached for 5 minutes', async () => {
+  const id = 'https://gone.example/c.json';
+  const ctx = setup();
+  assert.equal(await ctx.provider.clientsStore.getClient(id), undefined);
+  assert.equal(await ctx.provider.clientsStore.getClient(id), undefined);
+  assert.equal(ctx.lookups.length, 1);
+  assert.equal(ctx.fetches.length, 1);
+  ctx.advance(5 * 60_000 + 1);
+  assert.equal(await ctx.provider.clientsStore.getClient(id), undefined);
+  assert.equal(ctx.fetches.length, 2);
+});
+
+// ---------------- pinned TLS fetch (real sockets) ----------------
+
+const fixture = name => readFileSync(new URL('./fixtures/' + name, import.meta.url));
+
+async function tlsServer(handler) {
+  const server = createServer({ key: fixture('pinned-test.key'), cert: fixture('pinned-test.crt') }, handler);
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  return { port: server.address().port, close: () => new Promise(r => { server.closeAllConnections?.(); server.close(r); }) };
+}
+
+test('pinnedGet connects to the vetted address and validates the cert for the original host', async () => {
+  const seen = [];
+  const srv = await tlsServer((req, res) => {
+    seen.push({ host: req.headers.host, url: req.url });
+    if (req.url === '/redirect') { res.writeHead(302, { location: 'https://evil.example/' }); return res.end(); }
+    if (req.url === '/big') { res.writeHead(200); return res.end('x'.repeat(6000)); }
+    if (req.url === '/slow') return; // never answers
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const ca = fixture('pinned-test.crt');
+  const pin = { address: '127.0.0.1', family: 4 };
+  const opts = { timeoutMs: 2000, maxBytes: 5120, ca };
+  try {
+    // pinned.example does not resolve anywhere: success proves the socket used the pinned address.
+    assert.equal(await pinnedGet(new URL(`https://pinned.example:${srv.port}/c.json?a=1`), pin, opts), '{"ok":true}');
+    assert.deepEqual(seen[0], { host: `pinned.example:${srv.port}`, url: '/c.json?a=1' });
+    // Same address, different hostname: the certificate check fails on the original name.
+    assert.equal(await pinnedGet(new URL(`https://other.example:${srv.port}/c.json`), pin, opts), null);
+    // No trusted CA: refused.
+    assert.equal(await pinnedGet(new URL(`https://pinned.example:${srv.port}/c.json`), pin, { ...opts, ca: undefined }), null);
+    assert.equal(await pinnedGet(new URL(`https://pinned.example:${srv.port}/redirect`), pin, opts), null);
+    assert.equal(await pinnedGet(new URL(`https://pinned.example:${srv.port}/big`), pin, opts), null);
+    const t0 = Date.now();
+    assert.equal(await pinnedGet(new URL(`https://pinned.example:${srv.port}/slow`), pin, { ...opts, timeoutMs: 300 }), null);
+    assert.ok(Date.now() - t0 < 1500);
+  } finally { await srv.close(); }
 });
