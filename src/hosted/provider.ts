@@ -44,6 +44,8 @@ export interface ProviderOptions {
   /** Fetches a metadata document pinned to a vetted address (tests inject one). */
   getDocument?: DocumentGetter;
   now?: () => number;
+  /** Called with the grant id whenever a grant is killed here (revocation or refresh replay). */
+  onGrantRevoked?: (grantId: string) => void;
 }
 
 const ACCESS_TTL_S = 3600;
@@ -173,6 +175,7 @@ export class ReachDogOAuthProvider implements OAuthServerProvider {
   readonly #publicUrl: string;
   readonly #accountsOrigin: string;
   readonly #now: () => number;
+  readonly #revokedListeners: Array<(grantId: string) => void> = [];
 
   constructor(opts: ProviderOptions) {
     if (!Buffer.isBuffer(opts.sealKey) || opts.sealKey.length !== 32) throw new Error('Invalid seal key');
@@ -182,6 +185,7 @@ export class ReachDogOAuthProvider implements OAuthServerProvider {
     this.#publicUrl = trimSlash(opts.publicUrl ?? 'https://mcp.reach.dog');
     this.#accountsOrigin = trimSlash(opts.accountsOrigin ?? 'https://accounts.reach.dog');
     this.#now = opts.now ?? Date.now;
+    if (opts.onGrantRevoked) this.#revokedListeners.push(opts.onGrantRevoked);
     this.issuer = new URL(this.#publicUrl).href;
     this.resource = new URL(this.#publicUrl + '/mcp');
     const getDocument: DocumentGetter = opts.getDocument
@@ -335,6 +339,11 @@ export class ReachDogOAuthProvider implements OAuthServerProvider {
     catch { throw new ServerError('Could not disconnect right now. Try again'); }
   }
 
+  /** Registers a listener for killed grants, so callers can drop anything they cached for that grant. */
+  onGrantRevoked(listener: (grantId: string) => void): void {
+    this.#revokedListeners.push(listener);
+  }
+
   // ---- helpers ----
 
   #open(kind: SealKind, token: unknown): SealPayload | null {
@@ -348,6 +357,8 @@ export class ReachDogOAuthProvider implements OAuthServerProvider {
   /** Drops local refresh tokens first, then revokes in Accounts (already revoked counts as done). */
   async #killGrant(grant_id: string): Promise<void> {
     await this.#store.dropGrant(grant_id);
+    // Local caches go before the Accounts call, so they are cleared even if Accounts is down.
+    for (const listener of this.#revokedListeners) { try { listener(grant_id); } catch { /* a listener never blocks revocation */ } }
     try { await this.#accounts.revoke(grant_id); }
     catch (e) { if (!(e instanceof ReconnectError)) throw e; }
   }

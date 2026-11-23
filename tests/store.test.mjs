@@ -203,3 +203,34 @@ test('takeOpenPending deletes only a request nobody is approving', async () => {
   assert.ok(await s.peekCode('p-done', 'pending'));
   assert.equal(await s.takeOpenPending('missing'), null);
 });
+
+test('registered clients carry last_used, which a read refreshes at most once an hour', async () => {
+  const s = fresh();
+  const col = db.collection('mcp_oauth_clients');
+  const before = Date.now();
+  await s.putClient({ client_id: 'a', redirect_uris: ['http://localhost:1/x'] });
+  const stamped = (await col.findOne({ _id: 'a' })).last_used;
+  assert.ok(stamped instanceof Date && stamped.getTime() >= before - 1000);
+  const info = await s.getClient('a');
+  assert.equal(info.last_used, undefined, 'last_used is bookkeeping, not client metadata');
+  // Read within the hour: no write.
+  const recent = new Date(Date.now() - 30 * 60_000);
+  await col.updateOne({ _id: 'a' }, { $set: { last_used: recent } });
+  await s.getClient('a');
+  assert.equal((await col.findOne({ _id: 'a' })).last_used.getTime(), recent.getTime());
+  // Read after more than an hour: refreshed.
+  await col.updateOne({ _id: 'a' }, { $set: { last_used: new Date(Date.now() - 2 * 3600_000) } });
+  await s.getClient('a');
+  assert.ok((await col.findOne({ _id: 'a' })).last_used.getTime() >= Date.now() - 60_000);
+  // A client stored before this field existed gets one on its next read.
+  await col.insertOne({ _id: 'old', client_id: 'old', redirect_uris: [] });
+  await s.getClient('old');
+  assert.ok((await col.findOne({ _id: 'old' })).last_used instanceof Date);
+});
+
+test('ensureIndexes expires OAuth clients unused for 90 days', async () => {
+  const s = fresh();
+  await s.ensureIndexes();
+  const idx = await db.collection('mcp_oauth_clients').indexes();
+  assert.ok(idx.some((i) => i.key.last_used === 1 && i.expireAfterSeconds === 90 * 86400), JSON.stringify(idx));
+});

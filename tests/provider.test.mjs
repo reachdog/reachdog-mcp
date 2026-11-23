@@ -610,3 +610,23 @@ test('denyRequest leaves a request that an Approve has claimed', async () => {
   const url = new URL(await ctx.provider.issueCode(id, GRANT));
   assert.ok(url.searchParams.get('code'));
 });
+
+test('killing a grant tells onGrantRevoked listeners, even when Accounts is down', async () => {
+  const ctx = setup();
+  const seen = [];
+  const fromOption = [];
+  const failing = new AccountsClient('https://accounts.test', async () => 'idtok', async () => { throw new Error('down'); });
+  const provider = new ReachDogOAuthProvider({
+    store: ctx.store, accounts: failing, sealKey: KEY, onGrantRevoked: (id) => fromOption.push(id),
+  });
+  provider.onGrantRevoked((id) => seen.push(id));
+  const c = await registered(provider);
+  const t1 = await tokens({ ...ctx, provider }, c);
+  await provider.exchangeRefreshToken(c, t1.refresh_token);
+  await assert.rejects(provider.exchangeRefreshToken(c, t1.refresh_token), InvalidGrantError);
+  assert.deepEqual(seen, ['g-1']);
+  assert.deepEqual(fromOption, ['g-1']);
+  const t2 = await tokens({ ...ctx, provider }, c);
+  await assert.rejects(provider.revokeToken(c, { token: t2.refresh_token }));
+  assert.deepEqual(seen, ['g-1', 'g-1']);
+});

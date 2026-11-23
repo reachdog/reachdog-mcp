@@ -29,6 +29,8 @@ type RecordFor<K extends CodeKind> = K extends 'code' ? CodeRecord : PendingReco
 export type RotateResult = 'ok' | 'reused' | 'unknown';
 
 const DAY = 86400;
+/** A client's last_used is rewritten at most this often, so busy clients do not write on every request. */
+const CLIENT_TOUCH_MS = 3600_000;
 const sha = (s: string): string => createHash('sha256').update(s).digest('hex');
 
 /** Current UTC day as YYYY-MM-DD. */
@@ -55,17 +57,27 @@ export class HostedStore {
     await this.col('mcp_oauth_refresh').createIndex({ grant_id: 1 });
     await this.col('mcp_spend').createIndex({ created_at: 1 }, { expireAfterSeconds: 7 * DAY });
     await this.col('mcp_quotes').createIndex({ created_at: 1 }, { expireAfterSeconds: 2 * DAY });
+    // Registration is open, so unused clients must not pile up forever.
+    await this.col('mcp_oauth_clients').createIndex({ last_used: 1 }, { expireAfterSeconds: 90 * DAY });
   }
 
   // ---- OAuth clients ----
   async getClient(id: string): Promise<any | undefined> {
-    const d = await this.col('mcp_oauth_clients').findOne({ _id: id as any });
+    const col = this.col('mcp_oauth_clients');
+    const d = await col.findOne({ _id: id as any });
     if (!d) return undefined;
-    const { _id, ...info } = d;
+    const { _id, last_used, ...info } = d;
+    const stale = new Date(Date.now() - CLIENT_TOUCH_MS);
+    if (!(last_used instanceof Date) || last_used < stale) {
+      // Conditional, so concurrent reads on many instances still write once an hour at most.
+      await col.updateOne({ _id: id as any, $or: [{ last_used: { $exists: false } }, { last_used: { $lt: stale } }] },
+        { $set: { last_used: new Date() } });
+    }
     return info;
   }
   async putClient(info: { client_id: string; [k: string]: unknown }): Promise<void> {
-    await this.col('mcp_oauth_clients').replaceOne({ _id: info.client_id as any }, { ...info }, { upsert: true });
+    const { last_used: _ignored, ...rest } = info;
+    await this.col('mcp_oauth_clients').replaceOne({ _id: info.client_id as any }, { ...rest, last_used: new Date() }, { upsert: true });
   }
 
   // ---- Authorization codes and pending authorize requests ----

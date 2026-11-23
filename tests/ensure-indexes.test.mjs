@@ -26,6 +26,8 @@ test('creates the connector indexes and says so', async () => {
     assert.equal((await ttl('mcp_oauth_refresh'))[0].key.last_used, 1);
     assert.equal((await ttl('mcp_spend'))[0].key.created_at, 1);
     assert.equal((await ttl('mcp_quotes'))[0].key.created_at, 1);
+    assert.equal((await ttl('mcp_oauth_clients'))[0].key.last_used, 1);
+    assert.equal((await ttl('mcp_oauth_clients'))[0].expireAfterSeconds, 90 * 86400);
     assert.ok((await db.collection('mcp_oauth_refresh').indexes()).some((i) => i.key.grant_id === 1));
   } finally { await c.close(); }
   assert.equal(run({ MONGO_URI: mongod.getUri(), MONGO_DB: 'idx_test' }).status, 0, 'idempotent');

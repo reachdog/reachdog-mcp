@@ -9,7 +9,8 @@ import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import type { ReachDogOAuthProvider } from './provider.ts';
 import {
-  AccountsUnavailable, GrantLimitError, ReconnectError, WalletError, type AccountsClient, type CreatedGrant,
+  AccountsUnavailable, GrantLimitError, PersonRequiredError, ReconnectError, WalletError,
+  type AccountsClient, type CreatedGrant,
 } from './accounts.ts';
 
 export interface ConsentDeps {
@@ -38,7 +39,8 @@ const esc = (s: string): string => s.replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
 const trimSlash = (s: string): string => s.replace(/\/+$/, '');
 
-interface Pass { raw: string; sid: string }
+/** `person` is false for guest and other non-person passes, which can never approve a connection. */
+interface Pass { raw: string; sid: string; person: boolean }
 
 function readCookie(req: Request, name: string): string | null {
   const header = req.headers.cookie;
@@ -60,7 +62,7 @@ function readPass(req: Request, nowMs: number): Pass | null {
     const p = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as Record<string, unknown>;
     if (typeof p.sid !== 'string' || p.sid.length === 0 || typeof p.exp !== 'number') return null;
     if (p.exp * 1000 <= nowMs) return null;
-    return { raw, sid: p.sid };
+    return { raw, sid: p.sid, person: p.kind === 'person' };
   } catch {
     return null;
   }
@@ -108,6 +110,8 @@ export function consentRouter(deps: ConsentDeps): express.Router {
   const message = (res: Response, status: number, text: string): void => {
     page(res, status, 'Reach Dog', `<h1>Reach Dog</h1><p>${esc(text)}</p>`);
   };
+  const guest = (res: Response): void => message(res, 403,
+    'Sign in with a Reach Dog account to connect. Guest sessions cannot connect apps.');
   const expired = (res: Response): void => message(res, 400,
     'This sign-in link expired. Start connecting again from your assistant.');
   const toAccounts = (res: Response, id: string): void => {
@@ -154,6 +158,7 @@ export function consentRouter(deps: ConsentDeps): express.Router {
       if (!id || !pending) return expired(res);
       const pass = readPass(req, now());
       if (!pass) return toAccounts(res, id);
+      if (!pass.person) return guest(res);
       page(res, 200, 'Connect to Reach Dog',
         form(id, pass.sid, pending.client_name, hostOf(pending.redirect_uri), DEFAULT_LIMIT), originOf(pending.redirect_uri));
     } catch (e) { next(e); }
@@ -167,6 +172,7 @@ export function consentRouter(deps: ConsentDeps): express.Router {
         if (!id) return expired(res);
         const pass = readPass(req, now());
         if (!pass) return toAccounts(res, id);
+        if (!pass.person) return guest(res);
         if (!csrfOk(id, pass.sid, body.csrf)) return message(res, 403, 'This form is no longer valid. Start connecting again from your assistant.');
         const pending = await deps.provider.peekPending(id);
         if (!pending) {
@@ -219,6 +225,7 @@ export function consentRouter(deps: ConsentDeps): express.Router {
             }
           } catch (e) {
             if (e instanceof ReconnectError) return toAccounts(res, id);
+            if (e instanceof PersonRequiredError) return guest(res);
             if (e instanceof GrantLimitError) {
               return message(res, 409, 'You have 10 connected apps. Disconnect one in your Reach Dog console, then try again.');
             }

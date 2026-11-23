@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   AccountsClient, setupWallet, metadataIdToken,
-  ReconnectError, WalletError, GrantLimitError, AccountsUnavailable,
+  ReconnectError, WalletError, GrantLimitError, AccountsUnavailable, AccountClosedError, PersonRequiredError,
 } from '../dist/hosted/accounts.js';
 
 const ORIGIN = 'https://accounts.example';
@@ -52,7 +52,7 @@ test('resolve and revoke send no pass header', async () => {
 const mapping = [
   ['grant_invalid', 401, ReconnectError], ['grant_revoked', 401, ReconnectError],
   ['wallet_ineligible', 409, WalletError], ['grant_limit', 409, GrantLimitError],
-  ['account_unavailable', 403, AccountsUnavailable], ['invalid_request', 422, AccountsUnavailable],
+  ['account_unavailable', 403, AccountClosedError], ['invalid_request', 422, AccountsUnavailable],
   ['caller_denied', 403, AccountsUnavailable], ['person_required', 403, AccountsUnavailable],
   ['mystery', 500, AccountsUnavailable],
 ];
@@ -129,22 +129,40 @@ test('metadataIdToken calls the metadata server', async () => {
   await assert.rejects(metadataIdToken('a', recorder(new Response('', { status: 500 })).f), AccountsUnavailable);
 });
 
-test('createGrant: a bare 401 or person_required 403 means sign in again', async () => {
+test('createGrant: a bare 401 means sign in again; person_required is its own error', async () => {
   const req = { client_name: 'n', redirect_host: 'h', daily_limit: 1 };
-  for (const reply of [json(401, { detail: 'Pass expired' }), json(403, { detail: { code: 'person_required' } })]) {
-    const c = new AccountsClient(ORIGIN, tok, recorder(reply).f);
-    await assert.rejects(c.createGrant('p', req), ReconnectError);
-  }
+  const c = new AccountsClient(ORIGIN, tok, recorder(json(401, { detail: 'Pass expired' })).f);
+  await assert.rejects(c.createGrant('p', req), ReconnectError);
+  const g = new AccountsClient(ORIGIN, tok, recorder(json(403, { detail: { code: 'person_required' } })).f);
+  await assert.rejects(g.createGrant('p', req), (e) => e instanceof PersonRequiredError && !(e instanceof ReconnectError));
   // other statuses without a code stay unavailable
   const c2 = new AccountsClient(ORIGIN, tok, recorder(json(500, { detail: 'x' })).f);
   await assert.rejects(c2.createGrant('p', req), AccountsUnavailable);
 });
 
-test('person_required means sign in again only for createGrant, never for revoke or wallet setup', async () => {
+test('person_required is PersonRequiredError only for createGrant, never for resolve, revoke or wallet setup', async () => {
   const reply = json(403, { detail: { code: 'person_required' } });
   const c = new AccountsClient(ORIGIN, tok, recorder(reply).f);
   await assert.rejects(c.resolve('g', 's'), (e) => e instanceof AccountsUnavailable);
   await assert.rejects(c.revoke('g'), (e) => e instanceof AccountsUnavailable);
   await assert.rejects(setupWallet('https://api.example', 'a', 'p', tok, recorder(reply).f), (e) => e instanceof AccountsUnavailable);
-  await assert.rejects(c.createGrant('p', { client_name: 'n', redirect_host: 'h', daily_limit: 1 }), ReconnectError);
+  await assert.rejects(c.createGrant('p', { client_name: 'n', redirect_host: 'h', daily_limit: 1 }), PersonRequiredError);
+});
+
+test('account_unavailable is a closed account only on resolve', async () => {
+  const reply = json(403, { detail: { code: 'account_unavailable' } });
+  const c = new AccountsClient(ORIGIN, tok, recorder(reply).f);
+  await assert.rejects(c.resolve('g', 's'), AccountClosedError);
+  await assert.rejects(c.revoke('g'), (e) => e instanceof AccountsUnavailable);
+  await assert.rejects(c.createGrant('p', { client_name: 'n', redirect_host: 'h', daily_limit: 1 }),
+    (e) => e instanceof AccountsUnavailable);
+});
+
+test('setupWallet: only the API 401 session_expired means sign in again', async () => {
+  const run = (resp) => setupWallet('https://api.example', 'a', 'p', tok, recorder(resp).f);
+  await assert.rejects(run(json(401, { detail: { code: 'session_expired' } })), ReconnectError);
+  await assert.rejects(run(json(401, { detail: { code: 'service_unauthorized' } })), (e) => e instanceof AccountsUnavailable);
+  await assert.rejects(run(json(401, { detail: 'x' })), (e) => e instanceof AccountsUnavailable);
+  await assert.rejects(run(json(403, { detail: { code: 'session_expired' } })), (e) => e instanceof AccountsUnavailable);
+  await assert.rejects(run(json(503, { detail: { code: 'wallet_unavailable' } })), (e) => e instanceof AccountsUnavailable);
 });

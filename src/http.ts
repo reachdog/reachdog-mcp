@@ -26,11 +26,23 @@ import { HostedStore } from './hosted/store.ts';
 import { ReachDogOAuthProvider } from './hosted/provider.ts';
 import { consentRouter } from './hosted/consent.ts';
 import {
-  AccountsClient, ReconnectError, metadataIdToken, setupWallet as walletSetup,
+  AccountClosedError, AccountsClient, ReconnectError, WalletError, metadataIdToken, setupWallet as walletSetup,
   type ResolvedGrant,
 } from './hosted/accounts.ts';
 
 export const RECONNECT = 'Reconnect Reach Dog in your assistant to continue.';
+const WALLET = "This Reach Dog account's wallet needs attention. Contact support.";
+const CLOSED = 'This Reach Dog account is closed. Disconnect Reach Dog in your assistant.';
+/**
+ * Per-IP OAuth rate limits (Ruling 17). Claude and ChatGPT call /token, /register and
+ * /revoke from a few shared server addresses, so the SDK defaults (50 and 20) would lock
+ * every user out. /authorize is reached from people's browsers and keeps the SDK default.
+ */
+export const OAUTH_RATE_LIMITS = {
+  token: { windowMs: 15 * 60_000, max: 3000 },
+  register: { windowMs: 60 * 60_000, max: 300 },
+  revoke: { windowMs: 15 * 60_000, max: 600 },
+} as const;
 const UNAVAILABLE = 'Reach Dog is having trouble right now. Try again in a few minutes.';
 const API_FAILED = 'Reach Dog had a problem completing this request. Try again in a minute.';
 const KEY_TTL_MS = 5 * 60_000;
@@ -116,6 +128,8 @@ export function createApp(deps: AppDeps): express.Express {
   const publicUrl = provider.issuer.replace(/\/+$/, '');
   const issuerUrl = new URL(provider.issuer);
   const keys = new KeyCache(deps.accounts, now);
+  // A grant revoked or replayed here must not keep serving from this instance's cache.
+  provider.onGrantRevoked((grantId) => keys.drop(grantId));
 
   const app = express();
   app.disable('x-powered-by');
@@ -135,6 +149,9 @@ export function createApp(deps: AppDeps): express.Express {
   app.use('/authorize', issOnErrors(provider.issuer));
   app.use(mcpAuthRouter({
     provider, issuerUrl, scopesSupported: SCOPES, resourceServerUrl: provider.resource, resourceName: 'Reach Dog',
+    tokenOptions: { rateLimit: { ...OAUTH_RATE_LIMITS.token } },
+    clientRegistrationOptions: { rateLimit: { ...OAUTH_RATE_LIMITS.register } },
+    revocationOptions: { rateLimit: { ...OAUTH_RATE_LIMITS.revoke } },
   }));
   app.use(consentRouter({
     provider, accounts: deps.accounts, setupWallet: deps.setupWallet, sealKey: deps.sealKey, publicUrl,
@@ -145,11 +162,15 @@ export function createApp(deps: AppDeps): express.Express {
 
   /** Only caller-facing text leaves the service: infrastructure details stay inside. */
   const failure = (e: unknown, grantId: string, line: ToolLog) => {
-    if (e instanceof ReconnectError || (e instanceof ApiError && (e.status === 401 || e.status === 403))) {
+    // Only an API 401 (invalid_key: the key was revoked) means reconnect. A 403 is a refusal the
+    // caller can read (wallet_frozen, insufficient_scope, ...) and goes through the 4xx path below.
+    if (e instanceof ReconnectError || (e instanceof ApiError && e.status === 401)) {
       keys.drop(grantId);
       line.status = 'reconnect';
       return text(RECONNECT, true);
     }
+    if (e instanceof WalletError) { line.status = 'error'; return text(WALLET, true); }
+    if (e instanceof AccountClosedError) { line.status = 'error'; return text(CLOSED, true); }
     if (e instanceof ApiError) {
       line.status = 'error';
       // The public API's own 4xx bodies help the assistant correct the call; 5xx bodies are not passed on.

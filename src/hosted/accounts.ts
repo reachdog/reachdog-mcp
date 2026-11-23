@@ -13,6 +13,14 @@ export class WalletError extends Error {
 export class GrantLimitError extends Error {
   constructor() { super('Too many connected apps. Disconnect another app first'); this.name = 'GrantLimitError'; }
 }
+/** The pass is not a direct person session (a guest or delegated pass): signing in again with it cannot help. */
+export class PersonRequiredError extends Error {
+  constructor() { super('Sign in with a Reach Dog account to connect'); this.name = 'PersonRequiredError'; }
+}
+/** The account behind a grant is closed or unavailable. Terminal for that grant. */
+export class AccountClosedError extends Error {
+  constructor() { super('This Reach Dog account is closed'); this.name = 'AccountClosedError'; }
+}
 export class AccountsUnavailable extends Error {
   constructor() { super('Reach Dog accounts are unavailable right now'); this.name = 'AccountsUnavailable'; }
 }
@@ -96,8 +104,10 @@ export class AccountsClient {
 
   async createGrant(pass: string, req: GrantRequest): Promise<CreatedGrant> {
     const { res, body } = await this.#call('POST', '/internal/connector-grants', req, pass);
-    // Only here does a refused pass mean "sign in again": a bare 401 or person_required.
-    if (res.status === 401 || errorCode(body) === 'person_required') throw new ReconnectError();
+    // Only here does a refused pass mean "sign in again": a bare 401. A guest or delegated
+    // pass (person_required) cannot be fixed by signing in with the same session.
+    if (res.status === 401) throw new ReconnectError();
+    if (errorCode(body) === 'person_required') throw new PersonRequiredError();
     if (res.status !== 201) throw mapFailure(body);
     if (!isObj(body) || !str(body.grant_id) || !str(body.grant_secret) || !str(body.key_id) || !num(body.daily_limit)) {
       throw new AccountsUnavailable();
@@ -108,6 +118,7 @@ export class AccountsClient {
   async resolve(grantId: string, grantSecret: string): Promise<ResolvedGrant> {
     const { res, body } = await this.#call('POST', '/internal/connector-grants/resolve',
       { grant_id: grantId, grant_secret: grantSecret });
+    if (res.status === 403 && errorCode(body) === 'account_unavailable') throw new AccountClosedError();
     if (res.status !== 200) throw mapFailure(body);
     if (!isObj(body) || !str(body.account_id) || !str(body.key) || !str(body.key_id) || !num(body.daily_limit)) {
       throw new AccountsUnavailable();
@@ -131,6 +142,8 @@ export async function setupWallet(
     Accept: 'application/json',
   };
   const { res, body } = await send(transport, walletUrl.replace(/\/+$/, '') + '/internal/console-wallet', 'POST', headers, '{}');
+  // The API refused the pass as expired: the person signs in again. Every other refusal is not theirs to fix.
+  if (res.status === 401 && errorCode(body) === 'session_expired') throw new ReconnectError();
   if (res.status !== 200) throw mapFailure(body);
   if (!isObj(body) || body.state !== 'active') throw new AccountsUnavailable();
 }

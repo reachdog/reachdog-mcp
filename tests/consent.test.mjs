@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { createHmac, randomBytes } from 'node:crypto';
 import express from 'express';
 import { consentRouter } from '../dist/hosted/consent.js';
-import { AccountsClient, ReconnectError, WalletError, GrantLimitError, AccountsUnavailable } from '../dist/hosted/accounts.js';
+import {
+  AccountsClient, ReconnectError, WalletError, GrantLimitError, AccountsUnavailable, PersonRequiredError,
+} from '../dist/hosted/accounts.js';
 
 const KEY = randomBytes(32);
 const NOW = 1_800_000_000_000;
@@ -15,7 +17,7 @@ const PENDING = {
 };
 const GRANT = { grant_id: 'g-1', grant_secret: 'gs-secret', key_id: 'k1', daily_limit: 10000 };
 const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
-const pass = (over = {}) => `${b64({ alg: 'none' })}.${b64({ sid: 'sess1', exp: NOW / 1000 + 600, ...over })}.sig`;
+const pass = (over = {}) => `${b64({ alg: 'none' })}.${b64({ sid: 'sess1', kind: 'person', exp: NOW / 1000 + 600, ...over })}.sig`;
 const csrf = (id, sid = 'sess1') => createHmac('sha256', KEY).update(`consent:${id}:${sid}`).digest('base64url');
 
 let server, base, h;
@@ -292,4 +294,31 @@ test('an oversized form body is a 400', async () => {
   reset();
   const r = await post(form({ daily_limit: 'x'.repeat(6000) }), pass());
   assert.equal(r.status, 400);
+});
+
+const GUEST = 'Sign in with a Reach Dog account to connect. Guest sessions cannot connect apps.';
+
+test('a guest pass gets a 403 sign-in page on GET and POST, never the form or a loop to /authorize', async () => {
+  for (const cookie of [pass({ kind: 'guest' }), pass({ kind: undefined })]) {
+    reset();
+    const g = await get('req1', cookie);
+    assert.equal(g.status, 403);
+    const body = await g.text();
+    assert.ok(body.includes(GUEST), body);
+    assert.ok(!body.includes('<form'));
+    const p = await post(form(), cookie);
+    assert.equal(p.status, 403);
+    assert.equal(p.headers.get('location'), null);
+    assert.ok((await p.text()).includes(GUEST));
+    assert.ok(!h.calls.some((c) => c[0] === 'createGrant'));
+  }
+});
+
+test('person_required from Accounts shows the guest page and releases the claim', async () => {
+  reset({ grantErrors: [new PersonRequiredError()] });
+  const r = await post(form(), pass());
+  assert.equal(r.status, 403);
+  assert.equal(r.headers.get('location'), null);
+  assert.ok((await r.text()).includes(GUEST));
+  assert.ok(h.calls.some((c) => c[0] === 'release'));
 });

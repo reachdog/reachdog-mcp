@@ -19,7 +19,7 @@ const SECRET = 'gs-very-secret-grant-value';
 const RECONNECT = 'Reconnect Reach Dog in your assistant to continue.';
 const title = { title: 'Tea', parameters: ['brand'] };
 const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
-const pass = () => `${b64({ alg: 'none' })}.${b64({ sid: 'sess1', exp: Math.floor(Date.now() / 1000) + 600 })}.sig`;
+const pass = () => `${b64({ alg: 'none' })}.${b64({ sid: 'sess1', kind: 'person', exp: Math.floor(Date.now() / 1000) + 600 })}.sig`;
 
 let mongod, mclient, n = 0;
 before(async () => {
@@ -39,8 +39,8 @@ const sendJson = (res, status, body, headers = {}) => {
 async function setup(opts = {}) {
   const db = mclient.db('http' + (n++));
   const store = new HostedStore(db);
-  const acc = { resolves: 0, revoked: false, key: 'rd_key_one', limit: 10000 };
-  const api = { revokedKeys: new Set(), titleCalls: 0, titleStatus: 200, titleBody: null };
+  const acc = { resolves: 0, revoked: false, key: 'rd_key_one', limit: 10000, resolveError: null, deletes: 0 };
+  const api = { revokedKeys: new Set(), titleCalls: 0, titleStatus: 200, titleBody: null, usageStatus: 200, usageBody: null };
   const accountsSrv = createServer(async (req, res) => {
     const body = await readBody(req);
     if (req.method === 'POST' && req.url === '/internal/connector-grants') {
@@ -50,16 +50,18 @@ async function setup(opts = {}) {
     if (req.method === 'POST' && req.url === '/internal/connector-grants/resolve') {
       acc.resolves++;
       const b = JSON.parse(body);
+      if (acc.resolveError) return sendJson(res, acc.resolveError[0], acc.resolveError[1]);
       if (acc.revoked || b.grant_secret !== SECRET) return sendJson(res, 401, { detail: { code: 'grant_revoked' } });
       return sendJson(res, 200, { account_id: 'a1', key: acc.key, key_id: 'k1', daily_limit: acc.limit });
     }
-    if (req.method === 'DELETE') { res.writeHead(204); return res.end(); }
+    if (req.method === 'DELETE') { acc.deletes++; acc.revoked = true; res.writeHead(204); return res.end(); }
     sendJson(res, 404, {});
   });
   const apiSrv = createServer(async (req, res) => {
     await readBody(req);
     const key = (req.headers.authorization ?? '').replace(/^Bearer /, '');
     if (api.revokedKeys.has(key)) return sendJson(res, 401, { detail: 'invalid key' });
+    if (req.url === '/v1/usage' && api.usageStatus !== 200) return sendJson(res, api.usageStatus, api.usageBody);
     if (req.url === '/v1/usage') return sendJson(res, 200, { parameter_price: 25, billing: 'wallet' });
     if (req.method === 'POST' && req.url === '/v1/title-matches') {
       api.titleCalls++;
@@ -129,6 +131,7 @@ async function connect(ctx, dailyLimit = '10000') {
   assert.equal(tok.status, 200);
   const tokens = await tok.json();
   ctx.refreshToken = tokens.refresh_token;
+  ctx.clientId = client_id;
   return tokens.access_token;
 }
 
@@ -370,5 +373,80 @@ test('infrastructure failures never reach the assistant; API 4xx bodies do, 5xx 
     assert.equal(bad.isError, true);
     assert.match(text(bad), /^Invalid no_such_tool input/);
     assert.equal(ctx.logs.at(-1).tool, 'unknown');
+  } finally { await client?.close(); await ctx.close(); }
+});
+
+test('an API 403 is a caller-facing refusal, not reconnect: the body passes through and the key stays cached', async () => {
+  const ctx = await setup();
+  let client;
+  try {
+    client = await mcpClient(ctx, await connect(ctx));
+    assert.equal((await client.callTool({ name: 'get_usage', arguments: {} })).isError, false);
+    assert.equal(ctx.acc.resolves, 1);
+    ctx.api.usageStatus = 403;
+    ctx.api.usageBody = { detail: { code: 'wallet_frozen', message: 'This wallet is frozen.' } };
+    const r = await client.callTool({ name: 'get_usage', arguments: {} });
+    assert.equal(r.isError, true);
+    assert.notEqual(text(r), RECONNECT);
+    assert.deepEqual(JSON.parse(text(r)), { status: 403, error: ctx.api.usageBody });
+    assert.equal(ctx.logs.at(-1).status, 'error');
+    ctx.api.usageStatus = 200;
+    assert.equal((await client.callTool({ name: 'get_usage', arguments: {} })).isError, false);
+    assert.equal(ctx.acc.resolves, 1, 'a 403 must not drop the cached key');
+  } finally { await client?.close(); await ctx.close(); }
+});
+
+test('OAuth endpoints use the connector rate limits, not the SDK per-IP defaults', async () => {
+  const ctx = await setup();
+  try {
+    const headers = { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': '203.0.113.9' };
+    const limit = (r) => r.headers.get('ratelimit-limit');
+    let last;
+    for (let i = 0; i < 55; i++) {
+      last = await fetch(ctx.base + '/token', { method: 'POST', headers, body: 'grant_type=refresh_token' });
+      assert.notEqual(last.status, 429, 'token request ' + (i + 1));
+    }
+    assert.equal(limit(last), '3000');
+    const reg = await fetch(ctx.base + '/register', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(limit(reg), '300');
+    const rev = await fetch(ctx.base + '/revoke', { method: 'POST', headers, body: 'token=x' });
+    assert.equal(limit(rev), '600');
+  } finally { await ctx.close(); }
+});
+
+test('a closed account and a wallet problem are terminal messages, not reconnect', async () => {
+  const ctx = await setup();
+  let client;
+  try {
+    client = await mcpClient(ctx, await connect(ctx));
+    ctx.acc.resolveError = [403, { detail: { code: 'account_unavailable' } }];
+    const closed = await client.callTool({ name: 'get_usage', arguments: {} });
+    assert.equal(closed.isError, true);
+    assert.equal(text(closed), 'This Reach Dog account is closed. Disconnect Reach Dog in your assistant.');
+    ctx.acc.resolveError = [409, { detail: { code: 'wallet_ineligible' } }];
+    const wallet = await client.callTool({ name: 'get_usage', arguments: {} });
+    assert.equal(wallet.isError, true);
+    assert.equal(text(wallet), "This Reach Dog account's wallet needs attention. Contact support.");
+    assert.equal(ctx.logs.at(-1).status, 'error');
+  } finally { await client?.close(); await ctx.close(); }
+});
+
+test('revoking the connection at /revoke drops the cached key at once', async () => {
+  const ctx = await setup();
+  let client;
+  try {
+    client = await mcpClient(ctx, await connect(ctx));
+    assert.equal((await client.callTool({ name: 'get_usage', arguments: {} })).isError, false);
+    assert.equal(ctx.acc.resolves, 1);
+    const rev = await fetch(ctx.base + '/revoke', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token: ctx.refreshToken, client_id: ctx.clientId }).toString(),
+    });
+    assert.equal(rev.status, 200);
+    assert.equal(ctx.acc.deletes, 1);
+    // The access token is still sealed-valid, but the cached key must be gone: Accounts now refuses.
+    const r = await client.callTool({ name: 'get_usage', arguments: {} });
+    assert.equal(text(r), RECONNECT);
+    assert.equal(ctx.acc.resolves, 2);
   } finally { await client?.close(); await ctx.close(); }
 });
