@@ -84,6 +84,38 @@ export class HostedStore {
     return d ? strip<K>(d) : null;
   }
 
+  // ---- Claiming a pending request (single approval per request) ----
+  /** Atomically claims a pending request for one approval. 'taken' when another approval holds it. */
+  async claimPending(id: string): Promise<'claimed' | 'taken' | 'missing'> {
+    const col = this.col('mcp_oauth_codes');
+    const live = { _id: sha(id) as any, kind: 'pending', expires: { $gt: new Date() } };
+    const won = await col.findOneAndUpdate({ ...live, claimed: { $ne: true } }, { $set: { claimed: true } });
+    if (won) return 'claimed';
+    return (await col.findOne(live)) ? 'taken' : 'missing';
+  }
+  /** Gives the claim back so the person can retry. A request that already issued a code stays done. */
+  async releasePending(id: string): Promise<void> {
+    await this.col('mcp_oauth_codes').updateOne(
+      { _id: sha(id) as any, kind: 'pending', redirect: { $exists: false } },
+      { $unset: { claimed: '', done: '' } });
+  }
+  /** Atomically marks the request used and returns it. Null if missing, expired or already used. */
+  async finishPending(id: string): Promise<PendingRecord | null> {
+    const d = await this.col('mcp_oauth_codes').findOneAndUpdate(
+      { _id: sha(id) as any, kind: 'pending', expires: { $gt: new Date() }, done: { $ne: true } },
+      { $set: { done: true, claimed: true } });
+    return d ? strip<'pending'>(d) : null;
+  }
+  /** Stores the (sealed) client redirect so a duplicate submit can follow it. */
+  async recordRedirect(id: string, sealed: string): Promise<void> {
+    await this.col('mcp_oauth_codes').updateOne({ _id: sha(id) as any, kind: 'pending' }, { $set: { redirect: sealed } });
+  }
+  async readRedirect(id: string): Promise<string | null> {
+    const d = await this.col('mcp_oauth_codes').findOne(
+      { _id: sha(id) as any, kind: 'pending', expires: { $gt: new Date() } });
+    return d && typeof d.redirect === 'string' ? d.redirect : null;
+  }
+
   // ---- Refresh tokens ----
   async putRefresh(jti: string, grant_id: string, client_id: string): Promise<void> {
     await this.col('mcp_oauth_refresh').insertOne(

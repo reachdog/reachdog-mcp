@@ -53,7 +53,7 @@ const mapping = [
   ['grant_invalid', 401, ReconnectError], ['grant_revoked', 401, ReconnectError],
   ['wallet_ineligible', 409, WalletError], ['grant_limit', 409, GrantLimitError],
   ['account_unavailable', 403, AccountsUnavailable], ['invalid_request', 422, AccountsUnavailable],
-  ['caller_denied', 403, AccountsUnavailable], ['person_required', 403, AccountsUnavailable],
+  ['caller_denied', 403, AccountsUnavailable], ['person_required', 403, ReconnectError],
   ['mystery', 500, AccountsUnavailable],
 ];
 for (const [code, status, Cls] of mapping) {
@@ -127,4 +127,15 @@ test('metadataIdToken calls the metadata server', async () => {
     'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=https%3A%2F%2Fa%20b&format=full');
   assert.equal(hdr(r.calls[0], 'Metadata-Flavor'), 'Google');
   await assert.rejects(metadataIdToken('a', recorder(new Response('', { status: 500 })).f), AccountsUnavailable);
+});
+
+test('createGrant: a bare 401 or person_required 403 means sign in again', async () => {
+  const req = { client_name: 'n', redirect_host: 'h', daily_limit: 1 };
+  for (const reply of [json(401, { detail: 'Pass expired' }), json(403, { detail: { code: 'person_required' } })]) {
+    const c = new AccountsClient(ORIGIN, tok, recorder(reply).f);
+    await assert.rejects(c.createGrant('p', req), ReconnectError);
+  }
+  // other statuses without a code stay unavailable
+  const c2 = new AccountsClient(ORIGIN, tok, recorder(json(500, { detail: 'x' })).f);
+  await assert.rejects(c2.createGrant('p', req), AccountsUnavailable);
 });

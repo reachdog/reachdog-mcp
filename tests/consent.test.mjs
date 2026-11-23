@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHmac, randomBytes } from 'node:crypto';
 import express from 'express';
 import { consentRouter } from '../dist/hosted/consent.js';
-import { ReconnectError, WalletError, GrantLimitError, AccountsUnavailable } from '../dist/hosted/accounts.js';
+import { AccountsClient, ReconnectError, WalletError, GrantLimitError, AccountsUnavailable } from '../dist/hosted/accounts.js';
 
 const KEY = randomBytes(32);
 const NOW = 1_800_000_000_000;
@@ -21,7 +21,7 @@ const csrf = (id, sid = 'sess1') => createHmac('sha256', KEY).update(`consent:${
 let server, base, h;
 function reset(over = {}) {
   h = {
-    calls: [], grantErrors: [], issueThrows: false, pending: { ...PENDING },
+    calls: [], grantErrors: [], issueThrows: false, claimed: false, done: null, peekThrows: false, grantDelay: 0, pending: { ...PENDING },
     deny: 'https://claude.ai/api/mcp/auth_callback?error=access_denied&state=st',
     ...over,
   };
@@ -29,17 +29,30 @@ function reset(over = {}) {
 before(async () => {
   reset();
   const provider = {
-    peekPending: async (id) => (id === 'req1' ? h.pending : null),
+    peekPending: async (id) => {
+      if (h.peekThrows) throw new Error('db down');
+      return id === 'req1' && !h.done ? h.pending : null;
+    },
+    claimRequest: async (id) => {
+      if (id !== 'req1') return 'missing';
+      if (h.claimed) return 'taken';
+      h.claimed = true;
+      return 'claimed';
+    },
+    releaseRequest: async () => { h.calls.push(['release']); h.claimed = false; },
+    finishedRedirect: async () => h.done,
     issueCode: async (id, grant) => {
       h.calls.push(['issueCode', id, grant.grant_id]);
       if (h.issueThrows) throw new Error('boom');
-      return 'https://claude.ai/api/mcp/auth_callback?code=CODE&state=st&iss=x';
+      h.done = 'https://claude.ai/api/mcp/auth_callback?code=CODE&state=st&iss=x';
+      return h.done;
     },
     denyRequest: async (id) => { h.calls.push(['deny', id]); return id === 'req1' ? h.deny : null; },
   };
   const accounts = {
     createGrant: async (p, req) => {
       h.calls.push(['createGrant', p, req]);
+      if (h.grantDelay) await new Promise((r) => setTimeout(r, h.grantDelay));
       const e = h.grantErrors.shift();
       if (e) throw e;
       return GRANT;
@@ -107,7 +120,7 @@ test('GET renders the exact copy, escapes values, no scripts, hardened headers',
   assert.ok(html.includes(csrf('req1')));
   assert.equal(r.headers.get('cache-control'), 'no-store');
   assert.equal(r.headers.get('content-security-policy'),
-    `default-src 'none'; style-src 'unsafe-inline'; form-action ${PUBLIC}; frame-ancestors 'none'`);
+    `default-src 'none'; style-src 'unsafe-inline'; form-action ${PUBLIC} https://claude.ai ${ACCOUNTS}; frame-ancestors 'none'`);
   assert.equal(r.headers.get('x-frame-options'), 'DENY');
   assert.equal(r.headers.get('referrer-policy'), 'no-referrer');
 });
@@ -198,5 +211,85 @@ test('issueCode failure revokes the grant and shows a start-again page', async (
   const r = await post(form(), pass());
   assert.equal(r.status, 409);
   assert.match(await r.text(), /start again/i);
-  assert.deepEqual(h.calls.at(-1), ['revoke', 'g-1']);
+  assert.ok(h.calls.some((c) => c[0] === 'revoke' && c[1] === 'g-1'));
+  assert.equal(h.claimed, false);
+});
+
+test('form-action lists the client origin, including a loopback client, and the 422 page too', async () => {
+  reset({ pending: { ...PENDING, redirect_uri: 'http://127.0.0.1:4567/callback' } });
+  const r = await get('req1', pass());
+  assert.equal(r.headers.get('content-security-policy'),
+    `default-src 'none'; style-src 'unsafe-inline'; form-action ${PUBLIC} http://127.0.0.1:4567 ${ACCOUNTS}; frame-ancestors 'none'`);
+  const r2 = await post(form({ daily_limit: '0' }), pass());
+  assert.match(r2.headers.get('content-security-policy'), /form-action https:\/\/mcp\.reach\.dog http:\/\/127\.0\.0\.1:4567 /);
+  // no pending request: only this site and accounts
+  const r3 = await get('nope', pass());
+  assert.match(r3.headers.get('content-security-policy'), /form-action https:\/\/mcp\.reach\.dog https:\/\/accounts\.reach\.dog;/);
+});
+
+test('a bare 401 from Accounts sends the person back to sign in on the same consent page', async () => {
+  reset();
+  const accounts = new AccountsClient('https://accounts.test', async () => 'idtok',
+    async () => new Response(JSON.stringify({ detail: 'Pass expired' }), { status: 401, headers: { 'content-type': 'application/json' } }));
+  const app = express();
+  app.use(consentRouter({
+    provider: { peekPending: async () => PENDING, claimRequest: async () => 'claimed', releaseRequest: async () => { h.calls.push(['release']); },
+      finishedRedirect: async () => null, issueCode: async () => 'x', denyRequest: async () => null },
+    accounts, sealKey: KEY, publicUrl: PUBLIC, accountsOrigin: ACCOUNTS, now: () => NOW, setupWallet: async () => {},
+  }));
+  const srv = await new Promise((r) => { const x = app.listen(0, '127.0.0.1', () => r(x)); });
+  try {
+    const r = await fetch(`http://127.0.0.1:${srv.address().port}/oauth/consent`, {
+      method: 'POST', redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', cookie: `__Secure-rd_pass=${pass()}` },
+      body: new URLSearchParams(form()).toString(),
+    });
+    assert.equal(r.status, 302);
+    assert.equal(r.headers.get('location'), authorize);
+    assert.ok(h.calls.some((c) => c[0] === 'release'));
+  } finally { srv.close(); }
+});
+
+test('two simultaneous Approve posts make one grant and both follow the same redirect', async () => {
+  reset({ grantDelay: 100 });
+  const p = pass();
+  const [a, b] = await Promise.all([post(form(), p), post(form(), p)]);
+  assert.equal(a.status, 302);
+  assert.equal(b.status, 302);
+  assert.equal(a.headers.get('location'), b.headers.get('location'));
+  assert.match(a.headers.get('location'), /code=CODE/);
+  assert.equal(h.calls.filter((c) => c[0] === 'createGrant').length, 1);
+  assert.equal(h.calls.filter((c) => c[0] === 'issueCode').length, 1);
+  // a late third click after completion also follows the same redirect
+  const c = await post(form(), p);
+  assert.equal(c.headers.get('location'), a.headers.get('location'));
+  assert.equal(h.calls.filter((x) => x[0] === 'createGrant').length, 1);
+});
+
+test('a duplicate Approve whose winner never finishes gets the already-approving page', async () => {
+  reset({ claimed: true });
+  const r = await post(form(), pass());
+  assert.equal(r.status, 409);
+  assert.match(await r.text(), /already being approved\. Return to your assistant\./);
+  assert.equal(h.calls.some((c) => c[0] === 'createGrant'), false);
+});
+
+test('a failed approval releases the claim so the person can retry', async () => {
+  reset({ grantErrors: [new AccountsUnavailable()] });
+  assert.equal((await post(form(), pass())).status, 503);
+  assert.equal(h.claimed, false);
+  assert.equal((await post(form(), pass())).status, 302);
+});
+
+test('an unexpected error is the 503 trouble page, not a 400', async () => {
+  reset({ peekThrows: true });
+  const r = await get('req1', pass());
+  assert.equal(r.status, 503);
+  assert.match(await r.text(), /having trouble right now/);
+});
+
+test('an oversized form body is a 400', async () => {
+  reset();
+  const r = await post(form({ daily_limit: 'x'.repeat(6000) }), pass());
+  assert.equal(r.status, 400);
 });

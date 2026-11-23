@@ -536,3 +536,25 @@ test('pinnedGet connects to the vetted address and validates the cert for the or
     assert.ok(Date.now() - t0 < 1500);
   } finally { await srv.close(); }
 });
+
+test('claimRequest allows one approval; issueCode after a claim records a sealed redirect a duplicate can read', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider, { redirect_uris: ['http://127.0.0.1:5/cb'] });
+  const { verifier: _v, challenge } = pkce();
+  const res = fakeRes();
+  await ctx.provider.authorize(c, { state: 's', scopes: [], codeChallenge: challenge, redirectUri: c.redirect_uris[0],
+    resource: new URL(RESOURCE) }, res);
+  const id = new URL(new URL(res.redirects[0].url).searchParams.get('return_to')).searchParams.get('request');
+  assert.equal(await ctx.provider.claimRequest(id), 'claimed');
+  assert.equal(await ctx.provider.claimRequest(id), 'taken');
+  assert.equal(await ctx.provider.claimRequest('nope'), 'missing');
+  assert.equal(await ctx.provider.finishedRedirect(id), null);
+  await ctx.provider.releaseRequest(id);
+  assert.equal(await ctx.provider.claimRequest(id), 'claimed');
+  const url = await ctx.provider.issueCode(id, GRANT);
+  assert.equal(await ctx.provider.finishedRedirect(id), url);
+  assert.equal(await ctx.provider.peekPending(id), null);
+  await assert.rejects(ctx.provider.issueCode(id, GRANT));
+  const raw = JSON.stringify(await db.collection('mcp_oauth_codes').find().toArray());
+  assert.ok(!raw.includes(new URL(url).searchParams.get('code')));
+});

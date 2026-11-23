@@ -206,12 +206,30 @@ export class ReachDogOAuthProvider implements OAuthServerProvider {
   async peekPending(id: string): Promise<PendingRequest | null> {
     if (typeof id !== 'string' || id.length === 0) return null;
     const rec = await this.#store.peekCode(id, 'pending');
-    return rec ? toPending(rec) : null;
+    return rec && rec.done !== true ? toPending(rec) : null;
   }
 
-  /** Consumes the pending request and returns the client redirect carrying the code. */
+  /** Claims a pending request for one approval; a duplicate submit gets 'taken'. */
+  async claimRequest(id: string): Promise<'claimed' | 'taken' | 'missing'> {
+    if (typeof id !== 'string' || id.length === 0) return 'missing';
+    return this.#store.claimPending(id);
+  }
+
+  /** Gives a claim back after a failed approval. */
+  async releaseRequest(id: string): Promise<void> {
+    if (typeof id === 'string' && id.length > 0) await this.#store.releasePending(id);
+  }
+
+  /** The client redirect an earlier approval of this request produced, if it has finished. */
+  async finishedRedirect(id: string): Promise<string | null> {
+    if (typeof id !== 'string' || id.length === 0) return null;
+    const sealed = await this.#store.readRedirect(id);
+    return sealed ? openValue('redirect', sealed, this.#key) : null;
+  }
+
+  /** Uses up the pending request once and returns the client redirect carrying the code. */
   async issueCode(id: string, grant: CreatedGrant): Promise<string> {
-    const rec = typeof id === 'string' && id ? await this.#store.takeCode(id, 'pending') : null;
+    const rec = typeof id === 'string' && id ? await this.#store.finishPending(id) : null;
     if (!rec) throw new InvalidRequestError('This sign-in request has expired. Start again from your assistant');
     const code = randomId();
     await this.#store.putCode(code, 'code', {
@@ -223,7 +241,9 @@ export class ReachDogOAuthProvider implements OAuthServerProvider {
       resource: this.resource.href,
       expires: new Date(this.#now() + CODE_TTL_MS),
     });
-    return this.#clientRedirect(rec, { code });
+    const url = this.#clientRedirect(rec, { code });
+    await this.#store.recordRedirect(id, sealValue('redirect', url, this.#key));
+    return url;
   }
 
   /** Consumes the pending request; null if it is unknown or expired. */

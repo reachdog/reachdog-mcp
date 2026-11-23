@@ -13,7 +13,8 @@ import {
 } from './accounts.ts';
 
 export interface ConsentDeps {
-  provider: Pick<ReachDogOAuthProvider, 'peekPending' | 'issueCode' | 'denyRequest'>;
+  provider: Pick<ReachDogOAuthProvider,
+    'peekPending' | 'issueCode' | 'denyRequest' | 'claimRequest' | 'releaseRequest' | 'finishedRedirect'>;
   accounts: Pick<AccountsClient, 'createGrant' | 'revoke'>;
   /** Pre-bound by the caller with the wallet URL, audience and ID token. */
   setupWallet: (pass: string) => Promise<void>;
@@ -27,6 +28,11 @@ const PASS_COOKIE = '__Secure-rd_pass';
 const DEFAULT_LIMIT = '10000';
 const MAX_LIMIT = 10_000_000;
 const MAX_ID = 512;
+const WAIT_MS = 5000;
+const POLL_MS = 200;
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+const originOf = (url: string): string | null => { try { return new URL(url).origin; } catch { return null; } };
 
 const esc = (s: string): string => s.replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
@@ -78,18 +84,25 @@ export function consentRouter(deps: ConsentDeps): express.Router {
   const now = deps.now ?? Date.now;
   const publicUrl = trimSlash(deps.publicUrl);
   const accountsOrigin = trimSlash(deps.accountsOrigin);
-  const csp = `default-src 'none'; style-src 'unsafe-inline'; form-action ${publicUrl}; frame-ancestors 'none'`;
+  const selfOrigin = originOf(publicUrl) ?? publicUrl;
+  const accountsOrig = originOf(accountsOrigin) ?? accountsOrigin;
 
-  const headers = (res: Response): void => {
+  /** form-action also governs redirects after the POST, so it lists every place the POST may send the person. */
+  const csp = (redirectOrigin?: string | null): string => {
+    const targets = [...new Set([selfOrigin, ...(redirectOrigin ? [redirectOrigin] : []), accountsOrig])];
+    return `default-src 'none'; style-src 'unsafe-inline'; form-action ${targets.join(' ')}; frame-ancestors 'none'`;
+  };
+
+  const headers = (res: Response, redirectOrigin?: string | null): void => {
     res.set({
       'Cache-Control': 'no-store',
-      'Content-Security-Policy': csp,
+      'Content-Security-Policy': csp(redirectOrigin),
       'X-Frame-Options': 'DENY',
       'Referrer-Policy': 'no-referrer',
     });
   };
-  const page = (res: Response, status: number, title: string, body: string): void => {
-    headers(res);
+  const page = (res: Response, status: number, title: string, body: string, redirectOrigin?: string | null): void => {
+    headers(res, redirectOrigin);
     res.status(status).type('html').send(document(title, body));
   };
   const message = (res: Response, status: number, text: string): void => {
@@ -128,6 +141,8 @@ export function consentRouter(deps: ConsentDeps): express.Router {
     + '</form>'
   );
 
+  const followRedirect = (res: Response, url: string): void => { headers(res); res.redirect(302, url); };
+
   const requestId = (v: unknown): string | null => (
     typeof v === 'string' && v.length > 0 && v.length <= MAX_ID ? v : null);
   const hostOf = (uri: string): string => { try { return new URL(uri).host; } catch { return ''; } };
@@ -140,7 +155,7 @@ export function consentRouter(deps: ConsentDeps): express.Router {
       const pass = readPass(req, now());
       if (!pass) return toAccounts(res, id);
       page(res, 200, 'Connect to Reach Dog',
-        form(id, pass.sid, pending.client_name, hostOf(pending.redirect_uri), DEFAULT_LIMIT));
+        form(id, pass.sid, pending.client_name, hostOf(pending.redirect_uri), DEFAULT_LIMIT), originOf(pending.redirect_uri));
     } catch (e) { next(e); }
   });
 
@@ -154,13 +169,19 @@ export function consentRouter(deps: ConsentDeps): express.Router {
         if (!pass) return toAccounts(res, id);
         if (!csrfOk(id, pass.sid, body.csrf)) return message(res, 403, 'This form is no longer valid. Start connecting again from your assistant.');
         const pending = await deps.provider.peekPending(id);
-        if (!pending) return expired(res);
+        if (!pending) {
+          // A duplicate Approve can arrive after the first one finished: follow its redirect.
+          const done = body.action === 'approve' ? await deps.provider.finishedRedirect(id) : null;
+          if (done) return followRedirect(res, done);
+          return expired(res);
+        }
+        const redirectHost = hostOf(pending.redirect_uri);
+        const redirectOrigin = originOf(pending.redirect_uri);
 
         if (body.action === 'cancel') {
           const url = await deps.provider.denyRequest(id);
           if (!url) return expired(res);
-          headers(res);
-          return res.redirect(302, url);
+          return followRedirect(res, url);
         }
         if (body.action !== 'approve') return message(res, 400, 'That request was not understood.');
 
@@ -168,47 +189,68 @@ export function consentRouter(deps: ConsentDeps): express.Router {
         const limit = /^[1-9][0-9]{0,7}$/.test(limitRaw) ? Number(limitRaw) : 0;
         if (limit < 1 || limit > MAX_LIMIT) {
           return page(res, 422, 'Connect to Reach Dog', form(id, pass.sid, pending.client_name,
-            hostOf(pending.redirect_uri), limitRaw.slice(0, 20),
-            `Enter a whole number of tokens from 1 to ${MAX_LIMIT.toLocaleString('en-US')}.`));
+            redirectHost, limitRaw.slice(0, 20),
+            `Enter a whole number of tokens from 1 to ${MAX_LIMIT.toLocaleString('en-US')}.`), redirectOrigin);
         }
 
-        const request = { client_name: pending.client_name, redirect_host: hostOf(pending.redirect_uri), daily_limit: limit };
-        let grant: CreatedGrant;
+        // One approval per request: a double click must not create two grants.
+        const claim = await deps.provider.claimRequest(id);
+        if (claim === 'missing') return expired(res);
+        if (claim === 'taken') {
+          for (let waited = 0; waited <= WAIT_MS; waited += POLL_MS) {
+            const url = await deps.provider.finishedRedirect(id);
+            if (url) return followRedirect(res, url);
+            await sleep(POLL_MS);
+          }
+          return message(res, 409, 'This request is already being approved. Return to your assistant.');
+        }
+
+        let issued = false;
         try {
+          const request = { client_name: pending.client_name, redirect_host: redirectHost, daily_limit: limit };
+          let grant: CreatedGrant;
           try {
-            grant = await deps.accounts.createGrant(pass.raw, request);
+            try {
+              grant = await deps.accounts.createGrant(pass.raw, request);
+            } catch (e) {
+              if (!(e instanceof WalletError)) throw e;
+              await deps.setupWallet(pass.raw);
+              grant = await deps.accounts.createGrant(pass.raw, request);
+            }
           } catch (e) {
-            if (!(e instanceof WalletError)) throw e;
-            await deps.setupWallet(pass.raw);
-            grant = await deps.accounts.createGrant(pass.raw, request);
+            if (e instanceof ReconnectError) return toAccounts(res, id);
+            if (e instanceof GrantLimitError) {
+              return message(res, 409, 'You have 10 connected apps. Disconnect one in your Reach Dog console, then try again.');
+            }
+            if (e instanceof WalletError) return message(res, 409, "This account's wallet needs attention. Contact support.");
+            if (e instanceof AccountsUnavailable) {
+              return message(res, 503, 'Reach Dog is having trouble right now. Try again in a few minutes.');
+            }
+            throw e;
           }
-        } catch (e) {
-          if (e instanceof ReconnectError) return toAccounts(res, id);
-          if (e instanceof GrantLimitError) {
-            return message(res, 409, 'You have 10 connected apps. Disconnect one in your Reach Dog console, then try again.');
-          }
-          if (e instanceof WalletError) return message(res, 409, "This account's wallet needs attention. Contact support.");
-          if (e instanceof AccountsUnavailable) {
-            return message(res, 503, 'Reach Dog is having trouble right now. Try again in a few minutes.');
-          }
-          throw e;
-        }
 
-        let url: string;
-        try {
-          url = await deps.provider.issueCode(id, grant);
-        } catch {
-          try { await deps.accounts.revoke(grant.grant_id); } catch { /* best effort */ }
-          return message(res, 409, 'Something went wrong while connecting. Please start again from your assistant.');
+          let url: string;
+          try {
+            url = await deps.provider.issueCode(id, grant);
+          } catch {
+            try { await deps.accounts.revoke(grant.grant_id); } catch { /* best effort */ }
+            return message(res, 409, 'Something went wrong while connecting. Please start again from your assistant.');
+          }
+          issued = true;
+          followRedirect(res, url);
+        } finally {
+          if (!issued) { try { await deps.provider.releaseRequest(id); } catch { /* best effort */ } }
         }
-        headers(res);
-        res.redirect(302, url);
       } catch (e) { next(e); }
     });
 
   router.use('/oauth/consent', (err: unknown, _req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) return next(err);
-    message(res, 400, 'That request was not understood. Start connecting again from your assistant.');
+    // Only body-parser errors carry a type; they are the sender's fault. Anything else is ours.
+    if (typeof (err as { type?: unknown } | null)?.type === 'string') {
+      return message(res, 400, 'That request was not understood. Start connecting again from your assistant.');
+    }
+    message(res, 503, 'Reach Dog is having trouble right now. Try again in a few minutes.');
   });
 
   return router;

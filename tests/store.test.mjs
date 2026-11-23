@@ -161,3 +161,28 @@ test('peekCode reads without consuming, honours kind and expiry', async () => {
   await s.putCode('old', 'code', codeDoc({ expires: new Date(Date.now() - 1000) }));
   assert.equal(await s.peekCode('old', 'code'), null);
 });
+
+test('claimPending: one winner, release gives it back, finish is single use and keeps the redirect', async () => {
+  const s = fresh();
+  await s.putCode('p-claim', 'pending', codeDoc());
+  assert.equal(await s.claimPending('nope'), 'missing');
+  const results = await Promise.all(Array.from({ length: 8 }, () => s.claimPending('p-claim')));
+  assert.equal(results.filter((r) => r === 'claimed').length, 1);
+  assert.equal(results.filter((r) => r === 'taken').length, 7);
+  await s.releasePending('p-claim');
+  assert.equal(await s.claimPending('p-claim'), 'claimed');
+  const rec = await s.finishPending('p-claim');
+  assert.equal(rec.client_id, 'c1');
+  assert.equal(await s.finishPending('p-claim'), null);
+  assert.equal(await s.readRedirect('p-claim'), null);
+  await s.recordRedirect('p-claim', 'sealed-value');
+  assert.equal(await s.readRedirect('p-claim'), 'sealed-value');
+  await s.releasePending('p-claim'); // finished requests cannot be re-opened
+  assert.equal(await s.claimPending('p-claim'), 'taken');
+});
+
+test('claimPending ignores expired requests', async () => {
+  const s = fresh();
+  await s.putCode('p-old', 'pending', codeDoc({ expires: new Date(Date.now() - 1000) }));
+  assert.equal(await s.claimPending('p-old'), 'missing');
+});
