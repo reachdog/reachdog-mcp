@@ -186,3 +186,20 @@ test('claimPending ignores expired requests', async () => {
   await s.putCode('p-old', 'pending', codeDoc({ expires: new Date(Date.now() - 1000) }));
   assert.equal(await s.claimPending('p-old'), 'missing');
 });
+
+test('takeOpenPending deletes only a request nobody is approving', async () => {
+  const s = fresh();
+  const pending = () => ({ client_id: 'c1', challenge: 'ch', redirect_uri: 'http://127.0.0.1:1/cb', expires: new Date(Date.now() + 60_000) });
+  await s.putCode('p-open', 'pending', pending());
+  assert.equal((await s.takeOpenPending('p-open')).client_id, 'c1');
+  assert.equal(await s.peekCode('p-open', 'pending'), null);
+  await s.putCode('p-claimed', 'pending', pending());
+  assert.equal(await s.claimPending('p-claimed'), 'claimed');
+  assert.equal(await s.takeOpenPending('p-claimed'), null);
+  assert.ok(await s.peekCode('p-claimed', 'pending'));
+  await s.putCode('p-done', 'pending', pending());
+  assert.ok(await s.finishPending('p-done'));
+  assert.equal(await s.takeOpenPending('p-done'), null);
+  assert.ok(await s.peekCode('p-done', 'pending'));
+  assert.equal(await s.takeOpenPending('missing'), null);
+});

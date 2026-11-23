@@ -596,3 +596,17 @@ test('CIMD fetch tries the next vetted address when the first one fails, within 
   assert.deepEqual(tried.map(t => t.addr), ['93.184.215.14', '2606:4700::1111']);
   for (const t of tried) assert.ok(t.timeoutMs > 0 && t.timeoutMs <= 2000, String(t.timeoutMs));
 });
+
+test('denyRequest leaves a request that an Approve has claimed', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const res = fakeRes();
+  await ctx.provider.authorize(c, { state: 's', scopes: [], codeChallenge: 'x', redirectUri: c.redirect_uris[0],
+    resource: new URL(RESOURCE) }, res);
+  const id = new URL(new URL(res.redirects[0].url).searchParams.get('return_to')).searchParams.get('request');
+  assert.equal(await ctx.provider.claimRequest(id), 'claimed');
+  assert.equal(await ctx.provider.denyRequest(id), null);
+  assert.ok(await ctx.provider.peekPending(id));
+  const url = new URL(await ctx.provider.issueCode(id, GRANT));
+  assert.ok(url.searchParams.get('code'));
+});

@@ -21,16 +21,18 @@ import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middlew
 import type { OAuthMetadata } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { ApiError, ReachDogClient } from './client.ts';
 import { Session, tools } from './tools.ts';
+import { ToolError } from './errors.ts';
 import { HostedStore } from './hosted/store.ts';
 import { ReachDogOAuthProvider } from './hosted/provider.ts';
 import { consentRouter } from './hosted/consent.ts';
 import {
-  AccountsClient, AccountsUnavailable, ReconnectError, metadataIdToken, setupWallet as walletSetup,
+  AccountsClient, ReconnectError, metadataIdToken, setupWallet as walletSetup,
   type ResolvedGrant,
 } from './hosted/accounts.ts';
 
 export const RECONNECT = 'Reconnect Reach Dog in your assistant to continue.';
 const UNAVAILABLE = 'Reach Dog is having trouble right now. Try again in a few minutes.';
+const API_FAILED = 'Reach Dog had a problem completing this request. Try again in a minute.';
 const KEY_TTL_MS = 5 * 60_000;
 const KEY_CACHE_MAX = 5000;
 const SCOPES = ['reachdog'];
@@ -122,7 +124,7 @@ export function createApp(deps: AppDeps): express.Express {
   // express-rate-limit's trust-proxy validation quiet.
   app.set('trust proxy', deps.trustProxyHops ?? 1);
 
-  app.get('/healthz', (_req, res) => { res.type('text').send('ok'); });
+  app.get('/health', (_req, res) => { res.type('text').send('ok'); });
 
   const metadata = {
     ...createOAuthMetadata({ provider, issuerUrl, scopesSupported: SCOPES }),
@@ -139,36 +141,43 @@ export function createApp(deps: AppDeps): express.Express {
     accountsOrigin: deps.accountsOrigin ?? 'https://accounts.reach.dog', now,
   }));
 
+  const toolNames = new Set(tools.map((t) => t.name));
+
+  /** Only caller-facing text leaves the service: infrastructure details stay inside. */
+  const failure = (e: unknown, grantId: string, line: ToolLog) => {
+    if (e instanceof ReconnectError || (e instanceof ApiError && (e.status === 401 || e.status === 403))) {
+      keys.drop(grantId);
+      line.status = 'reconnect';
+      return text(RECONNECT, true);
+    }
+    if (e instanceof ApiError) {
+      line.status = 'error';
+      // The public API's own 4xx bodies help the assistant correct the call; 5xx bodies are not passed on.
+      return text(JSON.stringify(e.status >= 400 && e.status < 500
+        ? { status: e.status, error: e.body } : { status: e.status, error: API_FAILED }), true);
+    }
+    if (e instanceof ToolError) { line.status = 'error'; return text(e.message, true); }
+    line.status = 'unavailable';
+    return text(UNAVAILABLE, true);
+  };
+
   const callTool = async (grantId: string, grantSecret: string, name: string, args: unknown) => {
-    const line: ToolLog = { event: 'tool_call', grant_id: grantId, tool: String(name).slice(0, 64), status: 'ok', charged_tokens: null };
+    const line: ToolLog = {
+      event: 'tool_call', grant_id: grantId, tool: toolNames.has(name) ? name : 'unknown', status: 'ok', charged_tokens: null,
+    };
     try {
-      let grant: ResolvedGrant;
-      try { grant = await keys.get(grantId, grantSecret); }
-      catch (e) {
-        line.status = e instanceof ReconnectError ? 'reconnect' : 'unavailable';
-        return text(e instanceof ReconnectError ? RECONNECT : UNAVAILABLE, true);
-      }
+      const grant = await keys.get(grantId, grantSecret);
       // Stateless requests never carry the client's initialize capabilities, so elicitation
       // cannot be offered: 'unsupported' makes the consent page's daily limit the approval.
       const session = new Session(new ReachDogClient(deps.apiUrl, grant.key), apiHost, 'connector:' + grantId,
         store.spend(grantId, grant.daily_limit), async () => 'unsupported', 120000, store.quotes(grantId));
-      try {
-        const value = await session.call(name, args as never) as Record<string, unknown> | null;
-        const isError = !!(value && typeof value === 'object' && 'error' in value && value.error);
-        if (value && typeof value.charged_tokens === 'number') line.charged_tokens = value.charged_tokens;
-        if (isError) line.status = 'error';
-        return text(JSON.stringify(value), isError);
-      } catch (e) {
-        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
-          keys.drop(grantId);
-          line.status = 'reconnect';
-          return text(RECONNECT, true);
-        }
-        line.status = 'error';
-        const message = e instanceof ApiError ? JSON.stringify({ status: e.status, error: e.body })
-          : e instanceof Error && !(e instanceof TypeError) ? e.message : 'Tool invocation failed';
-        return text(message, true);
-      }
+      const value = await session.call(name, args as never) as Record<string, unknown> | null;
+      const isError = !!(value && typeof value === 'object' && 'error' in value && value.error);
+      if (value && typeof value.charged_tokens === 'number') line.charged_tokens = value.charged_tokens;
+      if (isError) line.status = 'error';
+      return text(JSON.stringify(value), isError);
+    } catch (e) {
+      return failure(e, grantId, line);
     } finally {
       log(line);
     }
@@ -239,8 +248,11 @@ async function main(): Promise<void> {
   const hops = Number(env.TRUST_PROXY_HOPS || '1');
   if (!Number.isInteger(hops) || hops < 0 || hops > 10) fail('TRUST_PROXY_HOPS must be a whole number from 0 to 10');
 
-  const mongo = new MongoClient(env.MONGO_URI as string);
-  try { await mongo.connect(); } catch { fail('Could not connect to MongoDB'); }
+  let mongo: MongoClient;
+  try {
+    mongo = new MongoClient(env.MONGO_URI as string);
+    await mongo.connect();
+  } catch { fail('Could not connect to MongoDB. Check MONGO_URI'); }
   const store = new HostedStore(mongo.db(env.MONGO_DB || 'rlly_meloquent'));
   const idToken = (audience: string) => metadataIdToken(audience);
   const accounts = new AccountsClient(accountsOrigin, idToken);

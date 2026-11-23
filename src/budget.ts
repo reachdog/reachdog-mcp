@@ -1,3 +1,4 @@
+import { ToolError } from './errors.ts';
 import { ApiError } from './client.ts';
 import type { Spend } from './state.ts';
 export function amount(x:unknown):number {
@@ -9,11 +10,11 @@ export class Budget implements Spend {
   private busy=new Set<string>();
   constructor(readonly limit?:number){if(limit!==undefined)amount(limit);}
   async runPaidPost<T>(id:string, estimate:number, post:()=>Promise<T>) {
-    if (this.busy.has(id)) throw new Error('Operation already in progress');
+    if (this.busy.has(id)) throw new ToolError('Operation already in progress');
     const prior=this.entries.get(id);
     const reserve=Math.max(prior??0,amount(estimate));
     const total=Array.from(this.entries.values()).reduce((a,b)=>a+b,0);
-    if(this.limit!==undefined && total-(prior??0)+reserve>this.limit) throw new Error('Session budget exceeded');
+    if(this.limit!==undefined && total-(prior??0)+reserve>this.limit) throw new ToolError('Session budget exceeded');
     this.busy.add(id); this.entries.set(id,reserve);
     try {return await post();}
     catch(e){

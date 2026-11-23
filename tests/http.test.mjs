@@ -36,11 +36,11 @@ const sendJson = (res, status, body, headers = {}) => {
 };
 
 /** Fake Accounts + fake API + the connector app, all on ephemeral ports. */
-async function setup() {
+async function setup(opts = {}) {
   const db = mclient.db('http' + (n++));
   const store = new HostedStore(db);
   const acc = { resolves: 0, revoked: false, key: 'rd_key_one', limit: 10000 };
-  const api = { revokedKeys: new Set(), titleCalls: 0 };
+  const api = { revokedKeys: new Set(), titleCalls: 0, titleStatus: 200, titleBody: null };
   const accountsSrv = createServer(async (req, res) => {
     const body = await readBody(req);
     if (req.method === 'POST' && req.url === '/internal/connector-grants') {
@@ -63,6 +63,7 @@ async function setup() {
     if (req.url === '/v1/usage') return sendJson(res, 200, { parameter_price: 25, billing: 'wallet' });
     if (req.method === 'POST' && req.url === '/v1/title-matches') {
       api.titleCalls++;
+      if (api.titleStatus !== 200) return sendJson(res, api.titleStatus, api.titleBody);
       return sendJson(res, 200, { brand: 'secret result text' }, { 'x-charge-state': 'settled', 'x-charged-tokens': '25' });
     }
     sendJson(res, 404, {});
@@ -78,7 +79,7 @@ async function setup() {
   const logs = [];
   let clock = Date.now();
   const app = createApp({
-    store, provider, accounts, apiUrl: apiBase, sealKey: KEY, accountsOrigin: 'https://accounts.test',
+    store: opts.wrapStore ? opts.wrapStore(store) : store, provider, accounts, apiUrl: apiBase, sealKey: KEY, accountsOrigin: 'https://accounts.test',
     setupWallet: async () => {}, now: () => clock, log: (line) => logs.push(line),
   });
   appSrv.on('request', app);
@@ -126,7 +127,9 @@ async function connect(ctx, dailyLimit = '10000') {
     }).toString(),
   });
   assert.equal(tok.status, 200);
-  return (await tok.json()).access_token;
+  const tokens = await tok.json();
+  ctx.refreshToken = tokens.refresh_token;
+  return tokens.access_token;
 }
 
 async function mcpClient(ctx, token, capabilities = {}) {
@@ -148,7 +151,7 @@ test('unauthenticated /mcp is 401 and names the protected resource metadata', as
     });
     assert.equal(res.status, 401);
     assert.match(res.headers.get('www-authenticate'), /resource_metadata="[^"]*\/\.well-known\/oauth-protected-resource\/mcp"/);
-    const h = await fetch(ctx.base + '/healthz');
+    const h = await fetch(ctx.base + '/health');
     assert.equal(h.status, 200);
   } finally { await ctx.close(); }
 });
@@ -304,4 +307,68 @@ test('main refuses to start without required settings and never prints values', 
   const noWallet = run({ MONGO_URI: 'mongodb://127.0.0.1:1/x', CONNECTOR_SEAL_KEY: randomBytes(32).toString('base64') });
   assert.notEqual(noWallet.status, 0);
   assert.match(noWallet.stderr, /WALLET_URL/);
+  const uriSentinel = 'sentinel-uri-host.example';
+  const badUri = run({ MONGO_URI: 'not-mongo://' + uriSentinel, CONNECTOR_SEAL_KEY: randomBytes(32).toString('base64'),
+    WALLET_URL: 'https://w.test', WALLET_AUDIENCE: 'aud' });
+  assert.notEqual(badUri.status, 0);
+  assert.match(badUri.stderr, /MONGO_URI/);
+  assert.ok(!badUri.stderr.includes(uriSentinel) && !badUri.stdout.includes(uriSentinel));
+});
+
+test('/mcp refuses a garbage bearer and a refresh token used as a bearer', async () => {
+  const ctx = await setup();
+  try {
+    await connect(ctx);
+    const call = (tok) => fetch(ctx.base + '/mcp', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + tok, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    for (const tok of ['garbage', ctx.refreshToken]) {
+      const res = await call(tok);
+      assert.equal(res.status, 401, tok === 'garbage' ? 'garbage' : 'refresh token');
+      assert.match(res.headers.get('www-authenticate'), /invalid_token/);
+    }
+  } finally { await ctx.close(); }
+});
+
+test('infrastructure failures never reach the assistant; API 4xx bodies do, 5xx bodies do not', async () => {
+  const host = 'mongo-secret-host.internal:27017';
+  const ctx = await setup({
+    wrapStore: (store) => Object.assign(Object.create(store), {
+      spend: (grantId, limit) => {
+        if (ctx.failSpend) throw new Error('connect ECONNREFUSED ' + host + ' collection mcp_spend');
+        return store.spend(grantId, limit);
+      },
+    }),
+  });
+  let client;
+  try {
+    client = await mcpClient(ctx, await connect(ctx));
+    ctx.failSpend = true;
+    const infra = await client.callTool({ name: 'get_usage', arguments: {} });
+    assert.equal(infra.isError, true);
+    assert.equal(text(infra), 'Reach Dog is having trouble right now. Try again in a few minutes.');
+    assert.ok(!text(infra).includes('mongo') && !JSON.stringify(ctx.logs).includes(host));
+    assert.equal(ctx.logs.at(-1).status, 'unavailable');
+    ctx.failSpend = false;
+
+    ctx.api.titleStatus = 501;
+    ctx.api.titleBody = { detail: 'stack trace at db-internal-7' };
+    const five = await client.callTool({ name: 'enrich_title', arguments: { body: title, confirm: true } });
+    assert.equal(five.isError, true);
+    assert.deepEqual(JSON.parse(text(five)),
+      { status: 501, error: 'Reach Dog had a problem completing this request. Try again in a minute.' });
+
+    ctx.api.titleStatus = 422;
+    ctx.api.titleBody = { detail: [{ loc: ['body', 'title'], msg: 'too short' }] };
+    const four = await client.callTool({ name: 'enrich_title', arguments: { body: title, confirm: true, run_label: 'c' } });
+    assert.equal(four.isError, true);
+    assert.deepEqual(JSON.parse(text(four)), { status: 422, error: ctx.api.titleBody });
+
+    const bad = await client.callTool({ name: 'no_such_tool', arguments: {} });
+    assert.equal(bad.isError, true);
+    assert.match(text(bad), /^Invalid no_such_tool input/);
+    assert.equal(ctx.logs.at(-1).tool, 'unknown');
+  } finally { await client?.close(); await ctx.close(); }
 });

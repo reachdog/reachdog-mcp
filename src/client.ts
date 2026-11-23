@@ -1,3 +1,4 @@
+import { ToolError } from './errors.ts';
 import type {
   CatalogRequest, CatalogPage, CatalogStatus, TitleRequest, ContentRequest, ResearchRequest,
 } from './api-types.ts';
@@ -42,7 +43,7 @@ function retryDelay(header: string | null, attempt: number) {
 }
 
 function batchPath(id: string) {
-  if (!id || id === '.' || id === '..') throw new Error('Invalid batch ID');
+  if (!id || id === '.' || id === '..') throw new ToolError('Invalid batch ID');
   return '/v1/batches/' + encodeURIComponent(id);
 }
 

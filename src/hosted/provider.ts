@@ -257,8 +257,8 @@ export class ReachDogOAuthProvider implements OAuthServerProvider {
 
   /**
    * Consumes an open pending request and returns an access_denied redirect. A request
-   * whose Approve already finished is left alone and its code redirect is returned;
-   * null if it is unknown or expired.
+   * that an Approve has claimed or finished is left alone: the finished code redirect is
+   * returned if there is one, else null (also for unknown or expired requests).
    */
   async denyRequest(id: string): Promise<string | null> {
     if (typeof id !== 'string' || id.length === 0) return null;

@@ -1,3 +1,4 @@
+import { ToolError } from '../errors.ts';
 import { createHash } from 'node:crypto';
 import type { Db, Document } from 'mongodb';
 import { ApiError } from '../client.ts';
@@ -93,10 +94,10 @@ export class HostedStore {
     if (won) return 'claimed';
     return (await col.findOne(live)) ? 'taken' : 'missing';
   }
-  /** Atomically deletes a pending request that has not issued a code. Null if missing, expired or done. */
+  /** Atomically deletes a pending request nobody is approving. Null if missing, expired, claimed or done. */
   async takeOpenPending(id: string): Promise<PendingRecord | null> {
     const d = await this.col('mcp_oauth_codes').findOneAndDelete(
-      { _id: sha(id) as any, kind: 'pending', expires: { $gt: new Date() }, done: { $ne: true } });
+      { _id: sha(id) as any, kind: 'pending', expires: { $gt: new Date() }, done: { $ne: true }, claimed: { $ne: true } });
     return d ? strip<'pending'>(d) : null;
   }
   /** Gives the claim back so the person can retry. A request that already issued a code stays done. */
@@ -172,7 +173,7 @@ class MongoSpend implements Spend {
     const d = await this.col.findOne({ _id: this.docId as any });
     const own = k ? ((d?.ops as Record<string, number> | undefined)?.[k] ?? 0) : 0;
     const left = Math.max(0, this.limit - (((d?.total as number | undefined) ?? 0) - own));
-    throw new Error(`Daily limit reached: ${left} of ${this.limit} Reach Dog tokens left today`);
+    throw new ToolError(`Daily limit reached: ${left} of ${this.limit} Reach Dog tokens left today`);
   }
 
   /** Returns the prior reservation (undefined if none). Throws when over the limit. */
@@ -208,7 +209,7 @@ class MongoSpend implements Spend {
 
   async runPaidPost<T>(id: string, estimate: number, post: () => Promise<T>): Promise<T> {
     const bk = `${this.docId}:${id}`;
-    if (this.busy.has(bk)) throw new Error('Operation already in progress');
+    if (this.busy.has(bk)) throw new ToolError('Operation already in progress');
     const k = sha(id).slice(0, 32);
     this.busy.add(bk);
     try {
