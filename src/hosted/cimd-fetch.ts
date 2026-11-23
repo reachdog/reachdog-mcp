@@ -9,7 +9,8 @@ import { BlockList, isIP } from 'node:net';
 
 export interface Address { address: string; family: 4 | 6 }
 export type Resolver = (host: string) => Promise<Address[]>;
-export type DocumentGetter = (url: URL, addr: Address) => Promise<string | null>;
+/** timeoutMs: what is left of the overall fetch budget for this attempt. */
+export type DocumentGetter = (url: URL, addr: Address, timeoutMs?: number) => Promise<string | null>;
 
 // Separate lists: a v6 list holding ::ffff:0:0/96 would also match every plain IPv4 address.
 const blocked4 = new BlockList();
@@ -49,15 +50,23 @@ export const systemResolver: Resolver = async host => {
   return rows.map(r => ({ address: r.address, family: r.family === 6 ? 6 : 4 }));
 };
 
-/** Resolves and vets a hostname. Returns the address to pin, or null if any result is not public. */
-export async function vetHost(host: string, resolve: Resolver): Promise<Address | null> {
+/**
+ * Resolves and vets a hostname. Returns every address to try, IPv4 first and otherwise in
+ * resolver order, or null if any result is not public.
+ */
+export async function vetHostAll(host: string, resolve: Resolver): Promise<Address[] | null> {
   if (!publicHostName(host)) return null;
   let rows: Address[];
   try { rows = await resolve(normalizeHost(host)); } catch { return null; }
   if (!Array.isArray(rows) || rows.length === 0) return null;
   if (!rows.every(r => r && typeof r.address === 'string' && isPublicAddress(r.address))) return null;
-  const a = rows[0];
-  return { address: a.address, family: isIP(a.address) === 6 ? 6 : 4 };
+  const all = rows.map(r => ({ address: r.address, family: (isIP(r.address) === 6 ? 6 : 4) as 4 | 6 }));
+  return [...all.filter(a => a.family === 4), ...all.filter(a => a.family === 6)];
+}
+
+/** The preferred vetted address (the first IPv4 if there is one), or null. */
+export async function vetHost(host: string, resolve: Resolver): Promise<Address | null> {
+  return (await vetHostAll(host, resolve))?.[0] ?? null;
 }
 
 export interface PinnedGetOptions { timeoutMs: number; maxBytes: number; ca?: string | Buffer }

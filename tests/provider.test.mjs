@@ -558,3 +558,41 @@ test('claimRequest allows one approval; issueCode after a claim records a sealed
   const raw = JSON.stringify(await db.collection('mcp_oauth_codes').find().toArray());
   assert.ok(!raw.includes(new URL(url).searchParams.get('code')));
 });
+
+test('denyRequest after Approve finished keeps the request and returns the finished redirect', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const { url, id } = await getCode(ctx, c);
+  assert.equal(await ctx.provider.denyRequest(id), url.href);
+  // still there: a duplicate Approve can follow the same redirect, and no access_denied was issued
+  assert.equal(await ctx.provider.finishedRedirect(id), url.href);
+  assert.equal(await ctx.provider.denyRequest(id), url.href);
+  assert.equal(await ctx.provider.denyRequest('unknown-request'), null);
+});
+
+test('vetHost prefers the first IPv4 address', async () => {
+  const rows = [{ address: '2606:4700::1111', family: 6 }, { address: '8.8.8.8', family: 4 }, { address: '1.1.1.1', family: 4 }];
+  assert.deepEqual(await vetHost('ok.example', async () => rows), { address: '8.8.8.8', family: 4 });
+  assert.deepEqual(await vetHost('ok.example', async () => [rows[0]]), { address: '2606:4700::1111', family: 6 });
+});
+
+test('CIMD fetch tries the next vetted address when the first one fails, within the time budget', async () => {
+  const id = 'https://dual.example/client.json';
+  const doc = { client_id: id, client_name: 'Dual', redirect_uris: [CB], token_endpoint_auth_method: 'none' };
+  const dns = { 'dual.example': [{ address: '2606:4700::1111', family: 6 }, { address: '93.184.215.14', family: 4 }] };
+  // IPv4 first; when it fails the IPv6 address is tried
+  const ctx = setup({ dns, docs: {} });
+  const tried = [];
+  const store = ctx.store;
+  const provider = new ReachDogOAuthProvider({
+    store, accounts: ctx.acc.client, sealKey: KEY, resolve: async h => dns[h],
+    getDocument: async (url, addr, timeoutMs) => {
+      tried.push({ addr: addr.address, timeoutMs });
+      return addr.family === 6 ? JSON.stringify(doc) : null;
+    },
+  });
+  const info = await provider.clientsStore.getClient(id);
+  assert.equal(info?.client_name, 'Dual');
+  assert.deepEqual(tried.map(t => t.addr), ['93.184.215.14', '2606:4700::1111']);
+  for (const t of tried) assert.ok(t.timeoutMs > 0 && t.timeoutMs <= 2000, String(t.timeoutMs));
+});

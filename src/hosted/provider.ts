@@ -19,7 +19,7 @@ import { open, openValue, seal, sealValue, type SealKind, type SealPayload } fro
 import { ReconnectError, type AccountsClient, type CreatedGrant } from './accounts.ts';
 import { allowedRedirect } from './redirects.ts';
 import {
-  pinnedGet, publicHostName, systemResolver, vetHost, type DocumentGetter, type Resolver,
+  pinnedGet, publicHostName, systemResolver, vetHostAll, type DocumentGetter, type Resolver,
 } from './cimd-fetch.ts';
 
 type AuthorizeResponse = Parameters<OAuthServerProvider['authorize']>[2];
@@ -51,6 +51,7 @@ const REFRESH_TTL_MS = 30 * 86400_000;
 const CODE_TTL_MS = 10 * 60_000;
 const CIMD_FRESH_MS = 86400_000;
 const CIMD_TIMEOUT_MS = 2000;
+const CIMD_MAX_ADDRS = 4;
 const CIMD_MAX_BYTES = 5 * 1024;
 const CIMD_NEGATIVE_MS = 5 * 60_000;
 const CIMD_NEGATIVE_MAX = 1000;
@@ -127,10 +128,17 @@ class ClientsStore implements OAuthRegisteredClientsStore {
   }
 
   private async fetchMetadata(url: URL, id: string): Promise<OAuthClientInformationFull | undefined> {
-    const addr = await vetHost(url.hostname, this.resolve);
-    if (!addr) return undefined;
-    let text: string | null;
-    try { text = await this.getDocument(url, addr); } catch { return undefined; }
+    const addrs = await vetHostAll(url.hostname, this.resolve);
+    if (!addrs) return undefined;
+    // IPv4 first (Cloud Run may lack IPv6 egress); later addresses only within the same budget.
+    const deadline = this.now() + CIMD_TIMEOUT_MS;
+    let text: string | null = null;
+    for (const addr of addrs.slice(0, CIMD_MAX_ADDRS)) {
+      const left = deadline - this.now();
+      if (left <= 0) break;
+      try { text = await this.getDocument(url, addr, left); } catch { text = null; }
+      if (text !== null) break;
+    }
     if (text === null || Buffer.byteLength(text) > CIMD_MAX_BYTES) return undefined;
     let doc: unknown;
     try { doc = JSON.parse(text); } catch { return undefined; }
@@ -177,7 +185,8 @@ export class ReachDogOAuthProvider implements OAuthServerProvider {
     this.issuer = new URL(this.#publicUrl).href;
     this.resource = new URL(this.#publicUrl + '/mcp');
     const getDocument: DocumentGetter = opts.getDocument
-      ?? ((url, addr) => pinnedGet(url, addr, { timeoutMs: CIMD_TIMEOUT_MS, maxBytes: CIMD_MAX_BYTES }));
+      ?? ((url, addr, timeoutMs) => pinnedGet(url, addr,
+        { timeoutMs: Math.min(CIMD_TIMEOUT_MS, timeoutMs ?? CIMD_TIMEOUT_MS), maxBytes: CIMD_MAX_BYTES }));
     this.clientsStore = new ClientsStore(this.#store, opts.resolve ?? systemResolver, getDocument, this.#now);
   }
 
@@ -246,10 +255,15 @@ export class ReachDogOAuthProvider implements OAuthServerProvider {
     return url;
   }
 
-  /** Consumes the pending request; null if it is unknown or expired. */
+  /**
+   * Consumes an open pending request and returns an access_denied redirect. A request
+   * whose Approve already finished is left alone and its code redirect is returned;
+   * null if it is unknown or expired.
+   */
   async denyRequest(id: string): Promise<string | null> {
-    const rec = typeof id === 'string' && id ? await this.#store.takeCode(id, 'pending') : null;
-    return rec ? this.#clientRedirect(rec, { error: 'access_denied' }) : null;
+    if (typeof id !== 'string' || id.length === 0) return null;
+    const rec = await this.#store.takeOpenPending(id);
+    return rec ? this.#clientRedirect(rec, { error: 'access_denied' }) : this.finishedRedirect(id);
   }
 
   #clientRedirect(rec: PendingRecord, params: Record<string, string>): string {

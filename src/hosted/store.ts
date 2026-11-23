@@ -93,6 +93,12 @@ export class HostedStore {
     if (won) return 'claimed';
     return (await col.findOne(live)) ? 'taken' : 'missing';
   }
+  /** Atomically deletes a pending request that has not issued a code. Null if missing, expired or done. */
+  async takeOpenPending(id: string): Promise<PendingRecord | null> {
+    const d = await this.col('mcp_oauth_codes').findOneAndDelete(
+      { _id: sha(id) as any, kind: 'pending', expires: { $gt: new Date() }, done: { $ne: true } });
+    return d ? strip<'pending'>(d) : null;
+  }
   /** Gives the claim back so the person can retry. A request that already issued a code stays done. */
   async releasePending(id: string): Promise<void> {
     await this.col('mcp_oauth_codes').updateOne(

@@ -15,6 +15,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "start:http": "node dist/http.js",
     "test": "npm run build && node --test tests/*.test.mjs",
     "prepack": "npm run build"
   },

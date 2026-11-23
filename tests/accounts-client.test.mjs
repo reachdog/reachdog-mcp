@@ -53,7 +53,7 @@ const mapping = [
   ['grant_invalid', 401, ReconnectError], ['grant_revoked', 401, ReconnectError],
   ['wallet_ineligible', 409, WalletError], ['grant_limit', 409, GrantLimitError],
   ['account_unavailable', 403, AccountsUnavailable], ['invalid_request', 422, AccountsUnavailable],
-  ['caller_denied', 403, AccountsUnavailable], ['person_required', 403, ReconnectError],
+  ['caller_denied', 403, AccountsUnavailable], ['person_required', 403, AccountsUnavailable],
   ['mystery', 500, AccountsUnavailable],
 ];
 for (const [code, status, Cls] of mapping) {
@@ -138,4 +138,13 @@ test('createGrant: a bare 401 or person_required 403 means sign in again', async
   // other statuses without a code stay unavailable
   const c2 = new AccountsClient(ORIGIN, tok, recorder(json(500, { detail: 'x' })).f);
   await assert.rejects(c2.createGrant('p', req), AccountsUnavailable);
+});
+
+test('person_required means sign in again only for createGrant, never for revoke or wallet setup', async () => {
+  const reply = json(403, { detail: { code: 'person_required' } });
+  const c = new AccountsClient(ORIGIN, tok, recorder(reply).f);
+  await assert.rejects(c.resolve('g', 's'), (e) => e instanceof AccountsUnavailable);
+  await assert.rejects(c.revoke('g'), (e) => e instanceof AccountsUnavailable);
+  await assert.rejects(setupWallet('https://api.example', 'a', 'p', tok, recorder(reply).f), (e) => e instanceof AccountsUnavailable);
+  await assert.rejects(c.createGrant('p', { client_name: 'n', redirect_host: 'h', daily_limit: 1 }), ReconnectError);
 });

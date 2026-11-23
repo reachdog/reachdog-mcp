@@ -43,7 +43,7 @@ function errorCode(body: unknown): string | undefined {
 
 function mapFailure(body: unknown): Error {
   const code = errorCode(body);
-  if (code === 'grant_invalid' || code === 'grant_revoked' || code === 'person_required') return new ReconnectError();
+  if (code === 'grant_invalid' || code === 'grant_revoked') return new ReconnectError();
   if (code === 'wallet_ineligible') return new WalletError();
   if (code === 'grant_limit') return new GrantLimitError();
   return new AccountsUnavailable();
@@ -96,7 +96,8 @@ export class AccountsClient {
 
   async createGrant(pass: string, req: GrantRequest): Promise<CreatedGrant> {
     const { res, body } = await this.#call('POST', '/internal/connector-grants', req, pass);
-    if (res.status === 401) throw new ReconnectError();
+    // Only here does a refused pass mean "sign in again": a bare 401 or person_required.
+    if (res.status === 401 || errorCode(body) === 'person_required') throw new ReconnectError();
     if (res.status !== 201) throw mapFailure(body);
     if (!isObj(body) || !str(body.grant_id) || !str(body.grant_secret) || !str(body.key_id) || !num(body.daily_limit)) {
       throw new AccountsUnavailable();
