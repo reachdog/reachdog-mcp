@@ -58,6 +58,7 @@ export function open(
     if (typeof token !== 'string' || token.length === 0 || token.length > 4096) return null;
     if (!/^[A-Za-z0-9_-]+$/.test(token)) return null;
     const raw = Buffer.from(token, 'base64url');
+    if (raw.toString('base64url') !== token) return null; // canonical encoding only
     if (raw.length <= IV_LEN + TAG_LEN) return null;
     const iv = raw.subarray(0, IV_LEN);
     const tag = raw.subarray(raw.length - TAG_LEN);

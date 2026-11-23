@@ -75,3 +75,27 @@ test('bad key length throws Invalid seal key', () => {
   assert.throws(() => seal('access', payload, Buffer.alloc(16)), /Invalid seal key/);
   assert.throws(() => open('access', 'abc', Buffer.alloc(31), now), /Invalid seal key/);
 });
+
+test('non-canonical encodings return null', () => {
+  const t = seal('access', payload, key);
+  assert.notEqual(open('access', t, key, now), null);
+  assert.equal(open('access', t + 'A', key, now), null);
+  // swap the last char for another that decodes to the same bytes (unused low bits)
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const raw = Buffer.from(t, 'base64url');
+  let variants = 0;
+  for (const c of alphabet) {
+    const v = t.slice(0, -1) + c;
+    if (v === t) continue;
+    if (Buffer.from(v, 'base64url').equals(raw)) {
+      variants++;
+      assert.equal(open('access', v, key, now), null);
+    }
+  }
+});
+
+test('truncated tokens return null', () => {
+  const raw = Buffer.from(seal('access', payload, key), 'base64url');
+  assert.equal(open('access', raw.subarray(0, raw.length - 1).toString('base64url'), key, now), null);
+  assert.equal(open('access', raw.subarray(0, raw.length - 16).toString('base64url'), key, now), null);
+});
