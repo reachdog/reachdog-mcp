@@ -30,8 +30,8 @@ Values are never committed. Secret Manager entries are given as references to th
 |---|---|---|---|
 | `MONGO_URI` | yes | none | Secret Manager reference. Connection string for the connector's Mongo user. |
 | `CONNECTOR_SEAL_KEY` | yes | none | Secret Manager reference. Base64 of exactly 32 random bytes. Startup refuses anything else. |
-| `WALLET_URL` | yes | none | Absolute URL of the API's wallet setup endpoint. |
-| `WALLET_AUDIENCE` | yes | none | Audience of the ID token sent to the wallet endpoint. Must equal the API's `CONSOLE_WALLET_AUDIENCE`. |
+| `WALLET_URL` | yes | none | Base URL of the Title API: its canonical run.app origin, with no path. The connector appends `/internal/console-wallet` itself. Use the same value as the API's `CONSOLE_WALLET_AUDIENCE`. |
+| `WALLET_AUDIENCE` | yes | none | Audience of the ID token sent to the wallet endpoint. Must equal the API's `CONSOLE_WALLET_AUDIENCE`, which is the same run.app origin as `WALLET_URL`. |
 | `MONGO_DB` | no | `rlly_meloquent` | Database that holds the `mcp_*` collections. |
 | `ACCOUNTS_ORIGIN` | no | `https://accounts.reach.dog` | Accounts service origin. |
 | `REACHDOG_API_URL` | no | `https://api.reach.dog` | Public API the tools call. |
@@ -44,7 +44,7 @@ Create the seal key with `openssl rand -base64 32` and store it straight into Se
 ## Infrastructure names
 
 - Cloud Run service: `rd-mcp-connector`, region `us-east1`, project `reachdog-308818`.
-- Service account: `rd-mcp-connector-sa`. It needs `secretmanager.secretAccessor` on the two secrets. It calls Accounts and the API wallet endpoint with ID tokens from the metadata server, so those two services must accept its identity.
+- Service account: `rd-mcp-connector-sa`. It needs `secretmanager.secretAccessor` on the two secrets. It calls Accounts and the API wallet endpoint with ID tokens from the metadata server, so those two services must accept its identity. These IAM needs are inferred from the code. Confirm with the sysadmin.
 - Command: the image default is the stdio server. Override the Cloud Run command to `node dist/http.js`.
 - Node: the image uses Node 24. Local runs need Node 24 or newer.
 - Health check: `GET /health`.
@@ -55,7 +55,7 @@ The connector's Mongo user gets read and write on these five collections in `MON
 
 | Collection | Holds | Expiry |
 |---|---|---|
-| `mcp_oauth_clients` | Registered and cached client metadata | none |
+| `mcp_oauth_clients` | Registered and cached client metadata | 90 days after `last_used` (refreshed at most once an hour when a client is used) |
 | `mcp_oauth_codes` | Pending authorize requests and authorization codes, stored hashed | `expires` field (10 minutes) |
 | `mcp_oauth_refresh` | Refresh token records | 30 days after `last_used` |
 | `mcp_spend` | Daily spend counters and reservations | 7 days after creation |
@@ -93,14 +93,15 @@ Coding sessions do not deploy, merge, or change Cloud Armor, DNS or IAM. These s
 ### Sysadmin
 
 - Create a Mongo user for the connector with read and write on the five `mcp_*` collections only, plus index creation on them.
-- Create the `CONNECTOR_SEAL_KEY` secret (32 random bytes, base64) and the `MONGO_URI` secret. Grant `rd-mcp-connector-sa` access to both.
+- Create the `CONNECTOR_SEAL_KEY` secret (32 random bytes, base64) and the `MONGO_URI` secret. Grant `rd-mcp-connector-sa` access to both. Confirm with the sysadmin that no other IAM role is needed.
 - Create the service account `rd-mcp-connector-sa` and the Cloud Run service `rd-mcp-connector` in us-east1 with the env vars above and the command override `node dist/http.js`. Set `TRUST_PROXY_HOPS=2`.
 - Accounts env: set `CONNECTOR_SERVICE_ACCOUNT` to the connector service account email and `CONNECTOR_GRANTS_ENABLED=true`. This requires `DEVELOPER_KEYS_ENABLED=true`. Accounts refuses to start if the connector and console identities are the same.
 - Accounts schema: run `python -m accounts.key_schema --apply`. Give the Accounts Mongo role read, insert and update on `match_connector_grants`.
-- API env: set `CONNECTOR_WALLET_IDENTITY` to the connector service account email. The connector's `WALLET_AUDIENCE` must equal the API's `CONSOLE_WALLET_AUDIENCE`.
+- API env: set `CONNECTOR_WALLET_IDENTITY` to the connector service account email. The connector's `WALLET_URL` and `WALLET_AUDIENCE` both equal the API's `CONSOLE_WALLET_AUDIENCE` (the Title API's canonical run.app origin).
 
 ### Operator
 
+- Prerequisite, before any test sign-in: Cloud Armor rule 2003 (RFI, signature 931130) must also allow accounts.reach.dog `/` and `/authorize` when `return_to` is `https://mcp.reach.dog/...`. This is the same pattern that has blocked sign-in since 2026-11-18. The operator already exempts `/` and `/authorize` for the platform and app return hosts. Confirm that exemption does not depend on the `return_to` host, or extend it to mcp.reach.dog. Without it every connector sign-in gets a 403 at Accounts.
 - DNS and the external load balancer for mcp.reach.dog, in front of Cloud Run.
 - Cloud Armor rule 2003 exemptions for mcp.reach.dog paths `/authorize`, `/register`, `/token`, `/revoke` and `/oauth/consent`. Confirm the `/.well-known` paths and `/mcp` are not blocked.
 - Run `scripts/ensure-indexes.mjs` against the production database.
@@ -111,6 +112,10 @@ Coding sessions do not deploy, merge, or change Cloud Armor, DNS or IAM. These s
 1. Part A (Accounts), then Part B (API), then Part C (this connector) deployed with no traffic.
 2. End-to-end check on the tagged revision with a fresh test account. The operator approves the free-token spend for that test.
 3. Then shift traffic.
+
+### Rate limits
+
+The OAuth endpoints limit requests per client address. Claude and ChatGPT reach `/token`, `/register` and `/revoke` from a few shared server addresses, so these limits are much higher than the SDK defaults: `/token` 3000 per 15 minutes, `/register` 300 per hour, `/revoke` 600 per 15 minutes. `/authorize` is opened by people's browsers and keeps the SDK default. The values live in `OAUTH_RATE_LIMITS` in `src/http.ts`. Tune them after launch if real traffic needs it.
 
 ### Rollback
 
