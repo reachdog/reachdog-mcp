@@ -273,7 +273,7 @@ New code lives in `src/hosted/`. `src/server.ts` (stdio) keeps working unchanged
 **Interfaces:**
 - Consumes: everything above; `Session`, `tools` from `src/tools.ts`.
 - Produces: `createApp(deps:{store, provider, accounts, apiUrl, sealKey, now?}): express.Express`; `http.ts` main reads env `MONGO_URI`, `CONNECTOR_SEAL_KEY`, `ACCOUNTS_ORIGIN` (default `https://accounts.reach.dog`), `WALLET_URL`, `REACHDOG_API_URL` (default `https://api.reach.dog`), `PUBLIC_URL` (default `https://mcp.reach.dog`), `PORT`.
-  - Routes: `mcpAuthRouter` (issuer `PUBLIC_URL`, resource `PUBLIC_URL + '/mcp'`), consent handlers, `GET /healthz`, `POST /mcp` behind `requireBearerAuth` (stateless: new `Server` and `StreamableHTTPServerTransport({sessionIdGenerator: undefined})` per request).
+  - Routes: `mcpAuthRouter` (issuer `PUBLIC_URL`, resource `PUBLIC_URL + '/mcp'`), consent handlers, `GET /health`, `POST /mcp` behind `requireBearerAuth` (stateless: new `Server` and `StreamableHTTPServerTransport({sessionIdGenerator: undefined})` per request).
   - Per request: resolve key via an in-memory cache (5 min, keyed by grant_id); build `ReachDogClient(apiUrl, key)`, `Session(client, apiHost, 'connector:'+grant_id, store.spend(grant_id, daily_limit), approve, 120000, store.quotes(grant_id))`. `approve` uses elicitation when the client supports form elicitation, else `'unsupported'` (so the daily limit applies, matching `mode()`).
   - API 401/403 from a resolved key, or `ReconnectError`: drop the cache entry and return tool error text `Reconnect Reach Dog in your assistant to continue.`
 
