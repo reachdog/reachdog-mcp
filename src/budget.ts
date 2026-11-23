@@ -1,9 +1,10 @@
 import { ApiError } from './client.ts';
+import type { Spend } from './state.ts';
 export function amount(x:unknown):number {
   if(typeof x!=='number'||!Number.isFinite(x)||x<0) throw new Error('Invalid billing amount');
   return x;
 }
-export class Budget {
+export class Budget implements Spend {
   private entries=new Map<string,number>();
   private busy=new Set<string>();
   constructor(readonly limit?:number){if(limit!==undefined)amount(limit);}
@@ -21,6 +22,6 @@ export class Budget {
       throw e;
     } finally {this.busy.delete(id);}
   }
-  settle(id:string,x:unknown){if(this.entries.has(id))this.entries.set(id,amount(x));}
-  refused(id:string){this.entries.delete(id);}
+  async settle(id:string,x:unknown){if(this.entries.has(id))this.entries.set(id,amount(x));}
+  async refused(id:string){this.entries.delete(id);}
 }
