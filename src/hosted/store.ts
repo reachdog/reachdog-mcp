@@ -6,17 +6,24 @@ import type { QuoteStore, Spend } from '../state.ts';
 
 export type CodeKind = 'pending' | 'code';
 
-export interface CodeRecord {
+/** A pending authorize request: no grant exists yet. */
+export interface PendingRecord {
   client_id: string;
-  grant_id: string;
-  /** Opaque value sealed by the caller. The store never sees a raw grant secret. */
-  sealed_secret: string;
   challenge: string;
   redirect_uri: string;
   resource?: string;
   expires: Date;
   [extra: string]: unknown;
 }
+
+/** An issued authorization code: always bound to a grant. */
+export interface CodeRecord extends PendingRecord {
+  grant_id: string;
+  /** Opaque value sealed by the caller. The store never sees a raw grant secret. */
+  sealed_secret: string;
+}
+
+type RecordFor<K extends CodeKind> = K extends 'code' ? CodeRecord : PendingRecord;
 
 export type RotateResult = 'ok' | 'reused' | 'unknown';
 
@@ -26,6 +33,11 @@ const sha = (s: string): string => createHash('sha256').update(s).digest('hex');
 /** Current UTC day as YYYY-MM-DD. */
 export function utcDay(now: Date = new Date()): string {
   return now.toISOString().slice(0, 10);
+}
+
+function strip<K extends CodeKind>(d: Document): RecordFor<K> {
+  const { _id, kind: _k, ...rec } = d;
+  return rec as unknown as RecordFor<K>;
 }
 
 /** MongoDB-backed state shared by every Cloud Run instance of the hosted connector. */
@@ -56,16 +68,20 @@ export class HostedStore {
   }
 
   // ---- Authorization codes and pending authorize requests ----
-  async putCode(code: string, kind: CodeKind, rec: CodeRecord): Promise<void> {
+  async putCode<K extends CodeKind>(code: string, kind: K, rec: RecordFor<K>): Promise<void> {
     await this.col('mcp_oauth_codes').replaceOne({ _id: sha(code) as any }, { ...rec, kind }, { upsert: true });
   }
   /** Atomic find-and-delete. Null if missing, wrong kind or expired. */
-  async takeCode(code: string, kind: CodeKind): Promise<CodeRecord | null> {
+  async takeCode<K extends CodeKind>(code: string, kind: K): Promise<RecordFor<K> | null> {
     const d = await this.col('mcp_oauth_codes').findOneAndDelete(
       { _id: sha(code) as any, kind, expires: { $gt: new Date() } });
-    if (!d) return null;
-    const { _id, kind: _k, ...rec } = d;
-    return rec as unknown as CodeRecord;
+    return d ? strip<K>(d) : null;
+  }
+  /** Non-destructive read. Null if missing, wrong kind or expired. */
+  async peekCode<K extends CodeKind>(code: string, kind: K): Promise<RecordFor<K> | null> {
+    const d = await this.col('mcp_oauth_codes').findOne(
+      { _id: sha(code) as any, kind, expires: { $gt: new Date() } });
+    return d ? strip<K>(d) : null;
   }
 
   // ---- Refresh tokens ----

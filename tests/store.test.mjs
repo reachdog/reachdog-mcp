@@ -144,3 +144,20 @@ test('refusal reports remaining excluding own prior reservation', async () => {
   await assert.rejects(sp.runPaidPost('other', 2000, async () => 1), /1000 of 10000/);
   await assert.rejects(sp.runPaidPost('big', 11000, async () => 1), /10000 of 10000/);
 });
+
+test('peekCode reads without consuming, honours kind and expiry', async () => {
+  const s = fresh();
+  await s.putCode('p1', 'pending', { client_id: 'c1', challenge: 'ch', redirect_uri: 'http://127.0.0.1:1/cb',
+    state: 'st', expires: new Date(Date.now() + 60_000) });
+  const a = await s.peekCode('p1', 'pending');
+  assert.equal(a.client_id, 'c1');
+  assert.equal(a.state, 'st');
+  assert.equal(a.grant_id, undefined);
+  assert.equal((await s.peekCode('p1', 'pending')).client_id, 'c1');
+  assert.equal(await s.peekCode('p1', 'code'), null);
+  assert.equal(await s.peekCode('missing', 'pending'), null);
+  assert.equal((await s.takeCode('p1', 'pending')).client_id, 'c1');
+  assert.equal(await s.peekCode('p1', 'pending'), null);
+  await s.putCode('old', 'code', codeDoc({ expires: new Date(Date.now() - 1000) }));
+  assert.equal(await s.peekCode('old', 'code'), null);
+});
