@@ -35,7 +35,7 @@ test('creates the connector indexes and says so', async () => {
 
 test('a bad connection string fails without echoing it', () => {
   const secret = 'hunter2-not-a-real-password';
-  const r = run({ MONGO_URI: `mongodb://user:${secret}@127.0.0.1:1/x`, MONGO_DB: 'idx_test' });
+  const r = run({ MONGO_URI: 'mongodb://user:' + secret + '@127.0.0.1:1/x', MONGO_DB: 'idx_test' });
   assert.notEqual(r.status, 0);
   assert.ok(r.stderr.includes('MONGO_URI'));
   assert.ok(!(r.stdout + r.stderr).includes(secret));

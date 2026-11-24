@@ -16,7 +16,10 @@ import { ReachDogOAuthProvider } from '../dist/hosted/provider.js';
 import { allowedRedirect, CLIENT_CALLBACKS } from '../dist/hosted/redirects.js';
 import { isPublicAddress, pinnedGet, publicHostName, vetHost } from '../dist/hosted/cimd-fetch.js';
 import { createServer } from 'node:https';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const KEY = randomBytes(32);
 const RESOURCE = 'https://mcp.reach.dog/mcp';
@@ -500,7 +503,18 @@ test('failed CIMD lookups are negatively cached for 5 minutes', async () => {
 
 // ---------------- pinned TLS fetch (real sockets) ----------------
 
-const fixture = name => readFileSync(new URL('./fixtures/' + name, import.meta.url));
+// Throwaway self-signed certificate for pinned.example, generated per run so no private key is
+// committed (the pregate secret scan refuses one, test paths included). Requires openssl on PATH.
+const pinned = (() => {
+  const dir = mkdtempSync(join(tmpdir(), 'pinned-'));
+  try {
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+      '-days', '1', '-subj', '/CN=pinned.example', '-addext', 'subjectAltName=DNS:pinned.example',
+      '-keyout', join(dir, 'k.pem'), '-out', join(dir, 'c.pem')], { stdio: 'ignore' });
+    return { key: readFileSync(join(dir, 'k.pem')), cert: readFileSync(join(dir, 'c.pem')) };
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+})();
+const fixture = name => (name === 'pinned-test.key' ? pinned.key : pinned.cert);
 
 async function tlsServer(handler) {
   const server = createServer({ key: fixture('pinned-test.key'), cert: fixture('pinned-test.crt') }, handler);
