@@ -1,0 +1,646 @@
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash, randomBytes } from 'node:crypto';
+import express from 'express';
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoClient } from 'mongodb';
+import { tokenHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/token.js';
+import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
+import {
+  InvalidGrantError, InvalidRequestError, InvalidTargetError, InvalidTokenError, OAuthError,
+} from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { HostedStore } from '../dist/hosted/store.js';
+import { AccountsClient } from '../dist/hosted/accounts.js';
+import { seal } from '../dist/hosted/seal.js';
+import { ReachDogOAuthProvider } from '../dist/hosted/provider.js';
+import { allowedRedirect, CLIENT_CALLBACKS } from '../dist/hosted/redirects.js';
+import { isPublicAddress, pinnedGet, publicHostName, vetHost } from '../dist/hosted/cimd-fetch.js';
+import { createServer } from 'node:https';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const KEY = randomBytes(32);
+const RESOURCE = 'https://mcp.reach.dog/mcp';
+const CB = 'http://127.0.0.1:4567/callback';
+const GRANT = { grant_id: 'g-1', grant_secret: 'gs-very-secret-value', key_id: 'k1', daily_limit: 10000 };
+
+let mongod, mclient, db, n = 0;
+before(async () => {
+  mongod = await MongoMemoryServer.create();
+  mclient = await MongoClient.connect(mongod.getUri());
+});
+after(async () => { await mclient?.close(); await mongod?.stop(); });
+
+/** Fake Accounts transport: records every call. */
+function fakeAccounts() {
+  const calls = [];
+  const transport = async (url, init) => {
+    calls.push({ url, method: init.method });
+    return new Response(null, { status: 204 });
+  };
+  return { calls, client: new AccountsClient('https://accounts.test', async () => 'idtok', transport) };
+}
+
+function setup(opts = {}) {
+  db = mclient.db('p' + (n++));
+  const store = new HostedStore(db);
+  const acc = fakeAccounts();
+  let clock = Date.now();
+  const fetches = [];
+  const lookups = [];
+  const docs = opts.docs ?? {};
+  const dns = opts.dns ?? {};
+  const resolve = async host => {
+    lookups.push(host);
+    if (dns[host]) return dns[host];
+    return [{ address: '93.184.215.14', family: 4 }];
+  };
+  const getDocument = async (url, addr) => {
+    fetches.push({ url: url.href, addr });
+    const d = docs[url.href];
+    if (d === undefined) return null;
+    return typeof d === 'string' ? d : JSON.stringify(d);
+  };
+  const provider = new ReachDogOAuthProvider({
+    store, accounts: acc.client, sealKey: KEY, resolve, getDocument, now: () => clock,
+  });
+  return { store, provider, acc, fetches, lookups, advance: ms => { clock += ms; }, now: () => clock };
+}
+
+const fakeRes = () => {
+  const r = { redirects: [] };
+  r.redirect = (status, url) => { r.redirects.push({ status, url }); };
+  return r;
+};
+
+async function registered(provider, over = {}) {
+  return provider.clientsStore.registerClient({
+    client_id: 'dcr-' + randomBytes(4).toString('hex'), client_id_issued_at: 1,
+    redirect_uris: [CB], token_endpoint_auth_method: 'none', client_name: 'Test App', ...over,
+  });
+}
+
+const pkce = () => {
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  return { verifier, challenge };
+};
+
+/** authorize -> consent approve -> code. Returns { code, verifier, client, url }. */
+async function getCode(ctx, client, state = 'st-1') {
+  const { verifier, challenge } = pkce();
+  const res = fakeRes();
+  await ctx.provider.authorize(client, {
+    state, scopes: [], codeChallenge: challenge, redirectUri: client.redirect_uris[0], resource: new URL(RESOURCE),
+  }, res);
+  const id = new URL(new URL(res.redirects[0].url).searchParams.get('return_to')).searchParams.get('request');
+  const url = new URL(await ctx.provider.issueCode(id, GRANT));
+  return { code: url.searchParams.get('code'), verifier, url, id };
+}
+
+async function tokens(ctx, client) {
+  const { code } = await getCode(ctx, client);
+  return ctx.provider.exchangeAuthorizationCode(client, code, undefined, client.redirect_uris[0], new URL(RESOURCE));
+}
+
+/** Real SDK token endpoint on an ephemeral port. */
+async function tokenServer(provider) {
+  const app = express();
+  app.use('/token', tokenHandler({ provider, rateLimit: false }));
+  const server = await new Promise(r => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  const base = `http://127.0.0.1:${server.address().port}/token`;
+  const post = async body => {
+    const res = await fetch(base, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(body).toString() });
+    return { status: res.status, body: await res.json() };
+  };
+  return { post, close: () => new Promise(r => server.close(r)) };
+}
+
+// ---------------- redirects ----------------
+
+test('client callbacks match exactly, nothing near them', () => {
+  for (const u of CLIENT_CALLBACKS) assert.equal(allowedRedirect(u), true, u);
+  assert.ok(CLIENT_CALLBACKS.includes('https://claude.ai/api/mcp/auth_callback'));
+  assert.ok(CLIENT_CALLBACKS.includes('https://chatgpt.com/connector_platform_oauth_redirect'));
+  for (const u of [
+    'https://claude.ai/api/mcp/auth_callback/', 'https://claude.ai/api/mcp/auth_callback?x=1',
+    'http://claude.ai/api/mcp/auth_callback', 'https://claude.ai/api/mcp/auth_callback#f',
+    'https://chatgpt.com/connector/oauth/abc123', 'https://CLAUDE.ai/api/mcp/auth_callback',
+  ]) assert.equal(allowedRedirect(u), false, u);
+});
+
+test('loopback any port and any path allowed; everything else refused', () => {
+  for (const u of ['http://127.0.0.1:1/cb', 'http://127.0.0.1:65535/a/b?x=1', 'http://localhost:3118/callback',
+    'http://localhost/callback', 'http://127.0.0.1/callback', 'http://localhost:9/'])
+    assert.equal(allowedRedirect(u), true, u);
+  for (const u of ['http://evil.example', 'http://evil.example:80/cb', 'https://127.0.0.1:5/cb', 'https://localhost:5/cb',
+    'http://user@127.0.0.1:5/cb', 'http://u:p@localhost:5/cb', 'http://127.0.0.1:5/cb#frag', 'http://127.0.0.1:5/cb#',
+    'http://[::1]:5/cb', 'http://127.0.0.1.evil.example/cb', 'http://localhost.evil.example/cb', 'http://127.1:5/cb',
+    'http://0x7f000001:5/cb', 'javascript:alert(1)', 'not a url', '', 'http://127.0.0.2:5/cb', 'ftp://127.0.0.1/cb'])
+    assert.equal(allowedRedirect(u), false, u);
+});
+
+// ---------------- registration ----------------
+
+test('registration refuses an unlisted redirect with invalid_redirect_uri', async () => {
+  const ctx = setup();
+  await assert.rejects(registered(ctx.provider, { redirect_uris: [CB, 'https://evil.example/cb'] }),
+    e => e instanceof OAuthError && e.errorCode === 'invalid_redirect_uri');
+  await assert.rejects(registered(ctx.provider, { redirect_uris: ['http://evil.example'] }),
+    e => e instanceof OAuthError && e.errorCode === 'invalid_redirect_uri');
+  const ok = await registered(ctx.provider, { redirect_uris: ['http://localhost:9999/cb'] });
+  assert.equal((await ctx.provider.clientsStore.getClient(ok.client_id)).redirect_uris[0], 'http://localhost:9999/cb');
+});
+
+test('authorize refuses an unlisted redirect even for a stored client', async () => {
+  const ctx = setup();
+  await ctx.store.putClient({ client_id: 'legacy', redirect_uris: ['https://evil.example/cb', CB] });
+  const c = await ctx.provider.clientsStore.getClient('legacy');
+  assert.deepEqual(c.redirect_uris, [CB]); // the SDK then refuses the evil one before any redirect
+  await assert.rejects(ctx.provider.authorize({ ...c, redirect_uris: ['https://evil.example/cb'] }, {
+    scopes: [], codeChallenge: 'x', redirectUri: 'https://evil.example/cb', resource: new URL(RESOURCE),
+  }, fakeRes()), InvalidRequestError);
+  await ctx.store.putClient({ client_id: 'allbad', redirect_uris: ['https://evil.example/cb'] });
+  assert.equal(await ctx.provider.clientsStore.getClient('allbad'), undefined);
+});
+
+// ---------------- authorize and consent hand-off ----------------
+
+test('authorize requires the exact resource', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const p = { scopes: [], codeChallenge: 'x', redirectUri: CB };
+  await assert.rejects(ctx.provider.authorize(c, p, fakeRes()), InvalidRequestError);
+  await assert.rejects(ctx.provider.authorize(c, { ...p, resource: new URL('https://mcp.reach.dog/other') }, fakeRes()),
+    InvalidTargetError);
+  await assert.rejects(ctx.provider.authorize(c, { ...p, resource: new URL('https://evil.example/mcp') }, fakeRes()),
+    InvalidTargetError);
+});
+
+test('authorize stores a pending request and sends the browser to Accounts', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const res = fakeRes();
+  await ctx.provider.authorize(c, { state: 'abc', scopes: ['reachdog'], codeChallenge: 'chal', redirectUri: CB,
+    resource: new URL(RESOURCE) }, res);
+  assert.equal(res.redirects.length, 1);
+  const { status, url } = res.redirects[0];
+  assert.equal(status, 302);
+  const m = /^https:\/\/accounts\.reach\.dog\/authorize\?return_to=(.+)$/.exec(url);
+  assert.ok(m, url);
+  const back = decodeURIComponent(m[1]);
+  assert.equal(m[1], encodeURIComponent(back));
+  const id = /^https:\/\/mcp\.reach\.dog\/oauth\/consent\?request=([A-Za-z0-9_-]{43})$/.exec(back)?.[1];
+  assert.ok(id, back);
+  const pend = await ctx.provider.peekPending(id);
+  assert.deepEqual(pend, { client_id: c.client_id, client_name: 'Test App', redirect_uri: CB, state: 'abc',
+    scopes: ['reachdog'], resource: RESOURCE });
+  assert.deepEqual(await ctx.provider.peekPending(id), pend); // non-destructive
+  assert.equal(await ctx.provider.peekPending('nope'), null);
+  const raw = JSON.stringify(await db.collection('mcp_oauth_codes').find().toArray());
+  assert.ok(!raw.includes(id)); // stored hashed
+});
+
+test('client name falls back to the redirect host and is truncated to 80', async () => {
+  const ctx = setup();
+  const anon = await registered(ctx.provider, { client_name: undefined, redirect_uris: ['http://localhost:8123/x'] });
+  const long = await registered(ctx.provider, { client_name: 'A'.repeat(200) });
+  for (const [c, want] of [[anon, 'localhost:8123'], [long, 'A'.repeat(80)]]) {
+    const res = fakeRes();
+    await ctx.provider.authorize(c, { scopes: [], codeChallenge: 'x', redirectUri: c.redirect_uris[0],
+      resource: new URL(RESOURCE) }, res);
+    const id = new URL(new URL(res.redirects[0].url).searchParams.get('return_to')).searchParams.get('request');
+    const p = await ctx.provider.peekPending(id);
+    assert.equal(p.client_name, want);
+    assert.equal(p.state, undefined);
+  }
+});
+
+test('issueCode returns the client redirect with code, state and iss; deny returns access_denied', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider, { redirect_uris: ['http://127.0.0.1:5/cb?keep=1'] });
+  const { url, id } = await getCode(ctx, c, 's&t=1');
+  assert.equal(url.origin + url.pathname, 'http://127.0.0.1:5/cb');
+  assert.equal(url.searchParams.get('keep'), '1');
+  assert.equal(url.searchParams.get('state'), 's&t=1');
+  assert.equal(url.searchParams.get('iss'), 'https://mcp.reach.dog/');
+  assert.match(url.searchParams.get('code'), /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(await ctx.provider.peekPending(id), null); // consumed
+  await assert.rejects(ctx.provider.issueCode(id, GRANT));
+  const raw = JSON.stringify(await db.collection('mcp_oauth_codes').find().toArray());
+  assert.ok(!raw.includes(GRANT.grant_secret));
+
+  const res = fakeRes();
+  await ctx.provider.authorize(c, { state: 'zz', scopes: [], codeChallenge: 'x', redirectUri: c.redirect_uris[0],
+    resource: new URL(RESOURCE) }, res);
+  const id2 = new URL(new URL(res.redirects[0].url).searchParams.get('return_to')).searchParams.get('request');
+  const denied = new URL(await ctx.provider.denyRequest(id2));
+  assert.equal(denied.searchParams.get('error'), 'access_denied');
+  assert.equal(denied.searchParams.get('state'), 'zz');
+  assert.equal(denied.searchParams.get('iss'), 'https://mcp.reach.dog/');
+  assert.equal(await ctx.provider.denyRequest(id2), null);
+});
+
+// ---------------- token endpoint (through the SDK handler) ----------------
+
+test('PKCE wrong verifier refused, right one works, code reuse refused (SDK token handler)', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const srv = await tokenServer(ctx.provider);
+  try {
+    const { code, verifier } = await getCode(ctx, c);
+    const base = { grant_type: 'authorization_code', client_id: c.client_id, code, redirect_uri: CB, resource: RESOURCE };
+    const bad = await srv.post({ ...base, code_verifier: pkce().verifier });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error, 'invalid_grant');
+    const ok = await srv.post({ ...base, code_verifier: verifier });
+    assert.equal(ok.status, 200, JSON.stringify(ok.body));
+    assert.equal(ok.body.token_type, 'bearer');
+    assert.equal(ok.body.expires_in, 3600);
+    assert.ok(ok.body.access_token && ok.body.refresh_token);
+    const again = await srv.post({ ...base, code_verifier: verifier });
+    assert.equal(again.status, 400);
+    assert.equal(again.body.error, 'invalid_grant');
+  } finally { await srv.close(); }
+});
+
+test('code is bound to its client, redirect and resource', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const other = await registered(ctx.provider);
+  let g = await getCode(ctx, c);
+  await assert.rejects(ctx.provider.challengeForAuthorizationCode(other, g.code), InvalidGrantError);
+  await assert.rejects(ctx.provider.exchangeAuthorizationCode(other, g.code, undefined, CB), InvalidGrantError);
+  g = await getCode(ctx, c);
+  await assert.rejects(ctx.provider.exchangeAuthorizationCode(c, g.code, undefined, 'http://127.0.0.1:9/other'),
+    InvalidGrantError);
+  g = await getCode(ctx, c);
+  await assert.rejects(ctx.provider.exchangeAuthorizationCode(c, g.code, undefined, CB, new URL('https://x.example/mcp')),
+    InvalidTargetError);
+  g = await getCode(ctx, c);
+  assert.equal(typeof await ctx.provider.challengeForAuthorizationCode(c, g.code), 'string');
+  const t = await ctx.provider.exchangeAuthorizationCode(c, g.code, undefined, undefined, undefined);
+  assert.ok(t.access_token);
+  await assert.rejects(ctx.provider.challengeForAuthorizationCode(c, 'unknown-code'), InvalidGrantError);
+});
+
+// ---------------- refresh ----------------
+
+test('refresh rotates with a new jti; the old one no longer works on its own', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const t1 = await tokens(ctx, c);
+  const t2 = await ctx.provider.exchangeRefreshToken(c, t1.refresh_token, undefined, new URL(RESOURCE));
+  assert.notEqual(t2.refresh_token, t1.refresh_token);
+  assert.equal(t2.expires_in, 3600);
+  const info = await ctx.provider.verifyAccessToken(t2.access_token);
+  assert.equal(info.extra.grant_id, GRANT.grant_id);
+  const t3 = await ctx.provider.exchangeRefreshToken(c, t2.refresh_token);
+  assert.ok(t3.access_token);
+  await assert.rejects(ctx.provider.exchangeRefreshToken(c, 'garbage'), InvalidGrantError);
+  const other = await registered(ctx.provider);
+  await assert.rejects(ctx.provider.exchangeRefreshToken(other, t3.refresh_token), InvalidGrantError);
+  await assert.rejects(ctx.provider.exchangeRefreshToken(c, t3.refresh_token, undefined, new URL('https://x.example/mcp')),
+    InvalidTargetError);
+  assert.equal(ctx.acc.calls.length, 0);
+});
+
+test('an access token is never accepted as a refresh token', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const t = await tokens(ctx, c);
+  await assert.rejects(ctx.provider.exchangeRefreshToken(c, t.access_token), InvalidGrantError);
+  assert.equal(ctx.acc.calls.length, 0);
+});
+
+test('refresh replay revokes the whole grant in Accounts', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const t1 = await tokens(ctx, c);
+  const t2 = await ctx.provider.exchangeRefreshToken(c, t1.refresh_token);
+  await assert.rejects(ctx.provider.exchangeRefreshToken(c, t1.refresh_token), InvalidGrantError);
+  assert.deepEqual(ctx.acc.calls, [{ url: 'https://accounts.test/internal/connector-grants/g-1', method: 'DELETE' }]);
+  assert.equal(await db.collection('mcp_oauth_refresh').countDocuments({ grant_id: 'g-1' }), 0);
+  await assert.rejects(ctx.provider.exchangeRefreshToken(c, t2.refresh_token), InvalidGrantError);
+});
+
+test('refresh replay still fails closed when Accounts is down', async () => {
+  const ctx = setup();
+  const failing = new AccountsClient('https://accounts.test', async () => 'idtok', async () => { throw new Error('down'); });
+  const provider = new ReachDogOAuthProvider({ store: ctx.store, accounts: failing, sealKey: KEY });
+  const c = await registered(provider);
+  const t1 = await tokens({ ...ctx, provider }, c);
+  const t2 = await provider.exchangeRefreshToken(c, t1.refresh_token);
+  await assert.rejects(provider.exchangeRefreshToken(c, t1.refresh_token), InvalidGrantError);
+  await assert.rejects(provider.exchangeRefreshToken(c, t2.refresh_token), InvalidGrantError);
+});
+
+// ---------------- access tokens ----------------
+
+test('verifyAccessToken returns AuthInfo for the MCP resource', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const t = await tokens(ctx, c);
+  const info = await ctx.provider.verifyAccessToken(t.access_token);
+  assert.equal(info.token, t.access_token);
+  assert.equal(info.clientId, c.client_id);
+  assert.deepEqual(info.scopes, ['reachdog']);
+  assert.equal(info.expiresAt, Math.floor(ctx.now() / 1000) + 3600);
+  assert.equal(info.resource.href, RESOURCE);
+  assert.deepEqual(info.extra, { grant_id: GRANT.grant_id, grant_secret: GRANT.grant_secret });
+});
+
+test('expired, foreign or wrong-kind access token -> InvalidTokenError and 401', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const t = await tokens(ctx, c);
+  const foreign = seal('access', { grant_id: 'g', grant_secret: 's', client_id: 'x', exp: Date.now() + 60_000, jti: 'j' },
+    randomBytes(32));
+  await assert.rejects(ctx.provider.verifyAccessToken(foreign), InvalidTokenError);
+  await assert.rejects(ctx.provider.verifyAccessToken(t.refresh_token), InvalidTokenError);
+  await assert.rejects(ctx.provider.verifyAccessToken('junk'), InvalidTokenError);
+
+  const mw = requireBearerAuth({ verifier: ctx.provider, expectedResource: new URL(RESOURCE) });
+  const call = async token => {
+    const res = { headers: {}, code: 0, set(k, v) { this.headers[k] = v; return this; },
+      status(s) { this.code = s; return this; }, json() { return this; } };
+    let passed = false;
+    await mw({ headers: { authorization: 'Bearer ' + token } }, res, () => { passed = true; });
+    return passed ? 200 : res.code;
+  };
+  assert.equal(await call(t.access_token), 200);
+  assert.equal(await call(foreign), 401);
+  ctx.advance(3601 * 1000);
+  await assert.rejects(ctx.provider.verifyAccessToken(t.access_token), InvalidTokenError);
+  assert.equal(await call(t.access_token), 401);
+});
+
+// ---------------- revocation ----------------
+
+test('revokeToken revokes the grant for refresh or access tokens; unknown tokens are ignored', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const t = await tokens(ctx, c);
+  await ctx.provider.revokeToken(c, { token: 'nonsense' });
+  assert.equal(ctx.acc.calls.length, 0);
+  await ctx.provider.revokeToken(c, { token: t.refresh_token, token_type_hint: 'refresh_token' });
+  assert.deepEqual(ctx.acc.calls, [{ url: 'https://accounts.test/internal/connector-grants/g-1', method: 'DELETE' }]);
+  assert.equal(await db.collection('mcp_oauth_refresh').countDocuments(), 0);
+  await assert.rejects(ctx.provider.exchangeRefreshToken(c, t.refresh_token), InvalidGrantError);
+  const t2 = await tokens(ctx, c);
+  await ctx.provider.revokeToken(c, { token: t2.access_token });
+  assert.equal(ctx.acc.calls.length, 2);
+  const other = await registered(ctx.provider);
+  await ctx.provider.revokeToken(other, { token: t2.refresh_token }); // not this client's token: ignored
+  assert.equal(ctx.acc.calls.length, 2);
+});
+
+// ---------------- Client ID Metadata Documents ----------------
+
+const CIMD = 'https://client.example/oauth/client.json';
+const cimdDoc = (over = {}) => ({ client_id: CIMD, client_name: 'Meta App', redirect_uris: [CB],
+  token_endpoint_auth_method: 'none', ...over });
+
+test('CIMD document is fetched safely, validated and cached for a day', async () => {
+  const ctx = setup({ docs: { [CIMD]: cimdDoc({ client_secret: 'should-not-stick' }) } });
+  const c = await ctx.provider.clientsStore.getClient(CIMD);
+  assert.equal(c.client_id, CIMD);
+  assert.equal(c.client_name, 'Meta App');
+  assert.equal(c.client_secret, undefined);
+  assert.equal(ctx.fetches.length, 1);
+  assert.deepEqual(ctx.fetches[0].addr, { address: '93.184.215.14', family: 4 }); // pinned to the vetted address
+  await ctx.provider.clientsStore.getClient(CIMD);
+  assert.equal(ctx.fetches.length, 1); // cached
+  ctx.advance(86400 * 1000 + 1);
+  await ctx.provider.clientsStore.getClient(CIMD);
+  assert.equal(ctx.fetches.length, 2); // stale, refetched
+});
+
+test('CIMD with mismatched client_id or a disallowed redirect is refused', async () => {
+  const a = 'https://a.example/client.json', b = 'https://b.example/client.json';
+  const ctx = setup({ docs: {
+    [a]: cimdDoc({ client_id: 'https://other.example/client.json' }),
+    [b]: { ...cimdDoc({ redirect_uris: [CB, 'https://evil.example/cb'] }), client_id: b },
+  } });
+  assert.equal(await ctx.provider.clientsStore.getClient(a), undefined);
+  assert.equal(await ctx.provider.clientsStore.getClient(b), undefined);
+  assert.equal(await db.collection('mcp_oauth_clients').countDocuments(), 0);
+});
+
+test('CIMD refuses non-https, private hosts, oversize and non-JSON documents', async () => {
+  const big = 'https://big.example/client.json', txt = 'https://txt.example/client.json';
+  const ctx = setup({ docs: {
+    [big]: JSON.stringify({ ...cimdDoc(), client_id: big, pad: 'x'.repeat(6000) }),
+    [txt]: 'not json',
+  } });
+  for (const id of ['http://client.example/c.json', 'https://127.0.0.1/c.json', 'https://localhost/c.json',
+    'https://10.1.2.3/c.json', 'https://192.168.0.1/c.json', 'https://169.254.169.254/c.json', 'https://[::1]/c.json',
+    'https://metadata.google.internal/c.json', 'https://foo.localhost/c.json', 'https://intranet/c.json',
+    'https://user@client.example/c.json', 'https://client.example/', 'https://localhost./c.json',
+    'https://metadata.google.internal./x', 'https://foo.localhost./x', 'https://intranet./x', 'https://a.local../x'])
+    assert.equal(await ctx.provider.clientsStore.getClient(id), undefined, id);
+  assert.equal(ctx.fetches.length, 0);
+  assert.equal(ctx.lookups.length, 0);
+  assert.equal(await ctx.provider.clientsStore.getClient(big), undefined);
+  assert.equal(await ctx.provider.clientsStore.getClient(txt), undefined);
+  assert.equal(await ctx.provider.clientsStore.getClient('https://missing.example/c.json'), undefined);
+});
+
+test('CIMD host must resolve only to public addresses', async () => {
+  const ids = {
+    priv: 'https://priv.example/c.json', mixed: 'https://mixed.example/c.json', mapped: 'https://mapped.example/c.json',
+    v6: 'https://v6.example/c.json', ok: 'https://ok.example/c.json', nip: 'https://127.0.0.1.nip.io/c.json',
+  };
+  const docs = Object.fromEntries(Object.values(ids).map(id => [id, { ...cimdDoc(), client_id: id }]));
+  const ctx = setup({ docs, dns: {
+    'priv.example': [{ address: '10.0.0.5', family: 4 }],
+    'mixed.example': [{ address: '93.184.215.14', family: 4 }, { address: '192.168.1.9', family: 4 }],
+    'mapped.example': [{ address: '::ffff:10.0.0.1', family: 6 }],
+    'v6.example': [{ address: 'fd00::1', family: 6 }],
+    '127.0.0.1.nip.io': [{ address: '127.0.0.1', family: 4 }],
+    'ok.example': [{ address: '2606:2800:21f:cb07:6820:80da:af6b:8b2c', family: 6 }],
+  } });
+  for (const k of ['priv', 'mixed', 'mapped', 'v6', 'nip'])
+    assert.equal(await ctx.provider.clientsStore.getClient(ids[k]), undefined, k);
+  assert.equal(ctx.fetches.length, 0);
+  const ok = await ctx.provider.clientsStore.getClient(ids.ok);
+  assert.equal(ok.client_id, ids.ok);
+  assert.deepEqual(ctx.fetches[0].addr, { address: '2606:2800:21f:cb07:6820:80da:af6b:8b2c', family: 6 });
+});
+
+test('address classification', async () => {
+  for (const a of ['10.0.0.5', '127.0.0.1', '172.16.0.1', '172.31.255.255', '192.168.0.1', '169.254.169.254',
+    '100.64.0.1', '0.0.0.0', '224.0.0.1', '255.255.255.255', '::', '::1', 'fe80::1', 'fc00::1', 'fd12::1', 'ff02::1',
+    '::ffff:10.0.0.1', '::ffff:8.8.8.8', '64:ff9b::a00:1', 'not-an-ip'])
+    assert.equal(isPublicAddress(a), false, a);
+  for (const a of ['8.8.8.8', '93.184.215.14', '172.32.0.1', '100.128.0.1', '2606:4700::1111'])
+    assert.equal(isPublicAddress(a), true, a);
+  for (const h of ['localhost.', 'metadata.google.internal.', 'foo.localhost.', 'intranet.', 'a.local..', '127.0.0.1.',
+    '[::1]', 'x.home.arpa.'])
+    assert.equal(publicHostName(h), false, h);
+  assert.equal(publicHostName('client.example.'), true);
+  assert.equal(await vetHost('localhost.', async () => [{ address: '8.8.8.8', family: 4 }]), null);
+  assert.equal(await vetHost('ok.example', async () => []), null);
+  assert.equal(await vetHost('ok.example', async () => { throw new Error('nxdomain'); }), null);
+  assert.deepEqual(await vetHost('OK.example.', async h => { assert.equal(h, 'ok.example'); return [{ address: '8.8.8.8', family: 4 }]; }),
+    { address: '8.8.8.8', family: 4 });
+});
+
+test('failed CIMD lookups are negatively cached for 5 minutes', async () => {
+  const id = 'https://gone.example/c.json';
+  const ctx = setup();
+  assert.equal(await ctx.provider.clientsStore.getClient(id), undefined);
+  assert.equal(await ctx.provider.clientsStore.getClient(id), undefined);
+  assert.equal(ctx.lookups.length, 1);
+  assert.equal(ctx.fetches.length, 1);
+  ctx.advance(5 * 60_000 + 1);
+  assert.equal(await ctx.provider.clientsStore.getClient(id), undefined);
+  assert.equal(ctx.fetches.length, 2);
+});
+
+// ---------------- pinned TLS fetch (real sockets) ----------------
+
+// Throwaway self-signed certificate for pinned.example, generated per run so no private key is
+// committed (the pregate secret scan refuses one, test paths included). Requires openssl on PATH.
+const pinned = (() => {
+  const dir = mkdtempSync(join(tmpdir(), 'pinned-'));
+  try {
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+      '-days', '1', '-subj', '/CN=pinned.example', '-addext', 'subjectAltName=DNS:pinned.example',
+      '-keyout', join(dir, 'k.pem'), '-out', join(dir, 'c.pem')], { stdio: 'ignore' });
+    return { key: readFileSync(join(dir, 'k.pem')), cert: readFileSync(join(dir, 'c.pem')) };
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+})();
+const fixture = name => (name === 'pinned-test.key' ? pinned.key : pinned.cert);
+
+async function tlsServer(handler) {
+  const server = createServer({ key: fixture('pinned-test.key'), cert: fixture('pinned-test.crt') }, handler);
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  return { port: server.address().port, close: () => new Promise(r => { server.closeAllConnections?.(); server.close(r); }) };
+}
+
+test('pinnedGet connects to the vetted address and validates the cert for the original host', async () => {
+  const seen = [];
+  const srv = await tlsServer((req, res) => {
+    seen.push({ host: req.headers.host, url: req.url });
+    if (req.url === '/redirect') { res.writeHead(302, { location: 'https://evil.example/' }); return res.end(); }
+    if (req.url === '/big') { res.writeHead(200); return res.end('x'.repeat(6000)); }
+    if (req.url === '/slow') return; // never answers
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const ca = fixture('pinned-test.crt');
+  const pin = { address: '127.0.0.1', family: 4 };
+  const opts = { timeoutMs: 2000, maxBytes: 5120, ca };
+  try {
+    // pinned.example does not resolve anywhere: success proves the socket used the pinned address.
+    assert.equal(await pinnedGet(new URL(`https://pinned.example:${srv.port}/c.json?a=1`), pin, opts), '{"ok":true}');
+    assert.deepEqual(seen[0], { host: `pinned.example:${srv.port}`, url: '/c.json?a=1' });
+    // Same address, different hostname: the certificate check fails on the original name.
+    assert.equal(await pinnedGet(new URL(`https://other.example:${srv.port}/c.json`), pin, opts), null);
+    // No trusted CA: refused.
+    assert.equal(await pinnedGet(new URL(`https://pinned.example:${srv.port}/c.json`), pin, { ...opts, ca: undefined }), null);
+    assert.equal(await pinnedGet(new URL(`https://pinned.example:${srv.port}/redirect`), pin, opts), null);
+    assert.equal(await pinnedGet(new URL(`https://pinned.example:${srv.port}/big`), pin, opts), null);
+    const t0 = Date.now();
+    assert.equal(await pinnedGet(new URL(`https://pinned.example:${srv.port}/slow`), pin, { ...opts, timeoutMs: 300 }), null);
+    assert.ok(Date.now() - t0 < 1500);
+  } finally { await srv.close(); }
+});
+
+test('claimRequest allows one approval; issueCode after a claim records a sealed redirect a duplicate can read', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider, { redirect_uris: ['http://127.0.0.1:5/cb'] });
+  const { verifier: _v, challenge } = pkce();
+  const res = fakeRes();
+  await ctx.provider.authorize(c, { state: 's', scopes: [], codeChallenge: challenge, redirectUri: c.redirect_uris[0],
+    resource: new URL(RESOURCE) }, res);
+  const id = new URL(new URL(res.redirects[0].url).searchParams.get('return_to')).searchParams.get('request');
+  assert.equal(await ctx.provider.claimRequest(id), 'claimed');
+  assert.equal(await ctx.provider.claimRequest(id), 'taken');
+  assert.equal(await ctx.provider.claimRequest('nope'), 'missing');
+  assert.equal(await ctx.provider.finishedRedirect(id), null);
+  await ctx.provider.releaseRequest(id);
+  assert.equal(await ctx.provider.claimRequest(id), 'claimed');
+  const url = await ctx.provider.issueCode(id, GRANT);
+  assert.equal(await ctx.provider.finishedRedirect(id), url);
+  assert.equal(await ctx.provider.peekPending(id), null);
+  await assert.rejects(ctx.provider.issueCode(id, GRANT));
+  const raw = JSON.stringify(await db.collection('mcp_oauth_codes').find().toArray());
+  assert.ok(!raw.includes(new URL(url).searchParams.get('code')));
+});
+
+test('denyRequest after Approve finished keeps the request and returns the finished redirect', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const { url, id } = await getCode(ctx, c);
+  assert.equal(await ctx.provider.denyRequest(id), url.href);
+  // still there: a duplicate Approve can follow the same redirect, and no access_denied was issued
+  assert.equal(await ctx.provider.finishedRedirect(id), url.href);
+  assert.equal(await ctx.provider.denyRequest(id), url.href);
+  assert.equal(await ctx.provider.denyRequest('unknown-request'), null);
+});
+
+test('vetHost prefers the first IPv4 address', async () => {
+  const rows = [{ address: '2606:4700::1111', family: 6 }, { address: '8.8.8.8', family: 4 }, { address: '1.1.1.1', family: 4 }];
+  assert.deepEqual(await vetHost('ok.example', async () => rows), { address: '8.8.8.8', family: 4 });
+  assert.deepEqual(await vetHost('ok.example', async () => [rows[0]]), { address: '2606:4700::1111', family: 6 });
+});
+
+test('CIMD fetch tries the next vetted address when the first one fails, within the time budget', async () => {
+  const id = 'https://dual.example/client.json';
+  const doc = { client_id: id, client_name: 'Dual', redirect_uris: [CB], token_endpoint_auth_method: 'none' };
+  const dns = { 'dual.example': [{ address: '2606:4700::1111', family: 6 }, { address: '93.184.215.14', family: 4 }] };
+  // IPv4 first; when it fails the IPv6 address is tried
+  const ctx = setup({ dns, docs: {} });
+  const tried = [];
+  const store = ctx.store;
+  const provider = new ReachDogOAuthProvider({
+    store, accounts: ctx.acc.client, sealKey: KEY, resolve: async h => dns[h],
+    getDocument: async (url, addr, timeoutMs) => {
+      tried.push({ addr: addr.address, timeoutMs });
+      return addr.family === 6 ? JSON.stringify(doc) : null;
+    },
+  });
+  const info = await provider.clientsStore.getClient(id);
+  assert.equal(info?.client_name, 'Dual');
+  assert.deepEqual(tried.map(t => t.addr), ['93.184.215.14', '2606:4700::1111']);
+  for (const t of tried) assert.ok(t.timeoutMs > 0 && t.timeoutMs <= 2000, String(t.timeoutMs));
+});
+
+test('denyRequest leaves a request that an Approve has claimed', async () => {
+  const ctx = setup();
+  const c = await registered(ctx.provider);
+  const res = fakeRes();
+  await ctx.provider.authorize(c, { state: 's', scopes: [], codeChallenge: 'x', redirectUri: c.redirect_uris[0],
+    resource: new URL(RESOURCE) }, res);
+  const id = new URL(new URL(res.redirects[0].url).searchParams.get('return_to')).searchParams.get('request');
+  assert.equal(await ctx.provider.claimRequest(id), 'claimed');
+  assert.equal(await ctx.provider.denyRequest(id), null);
+  assert.ok(await ctx.provider.peekPending(id));
+  const url = new URL(await ctx.provider.issueCode(id, GRANT));
+  assert.ok(url.searchParams.get('code'));
+});
+
+test('killing a grant tells onGrantRevoked listeners, even when Accounts is down', async () => {
+  const ctx = setup();
+  const seen = [];
+  const fromOption = [];
+  const failing = new AccountsClient('https://accounts.test', async () => 'idtok', async () => { throw new Error('down'); });
+  const provider = new ReachDogOAuthProvider({
+    store: ctx.store, accounts: failing, sealKey: KEY, onGrantRevoked: (id) => fromOption.push(id),
+  });
+  provider.onGrantRevoked((id) => seen.push(id));
+  const c = await registered(provider);
+  const t1 = await tokens({ ...ctx, provider }, c);
+  await provider.exchangeRefreshToken(c, t1.refresh_token);
+  await assert.rejects(provider.exchangeRefreshToken(c, t1.refresh_token), InvalidGrantError);
+  assert.deepEqual(seen, ['g-1']);
+  assert.deepEqual(fromOption, ['g-1']);
+  const t2 = await tokens({ ...ctx, provider }, c);
+  await assert.rejects(provider.revokeToken(c, { token: t2.refresh_token }));
+  assert.deepEqual(seen, ['g-1', 'g-1']);
+});

@@ -34,6 +34,10 @@ Ask your client to enrich one of your product titles with `product_type`. Review
 
 The session budget counts Reach Dog billing tokens. Set REACHDOG_MAX_TOKENS_PER_SESSION to a whole number to limit estimated spending across the process. A client with elicitation prompts for each payment. In a client without elicitation, configuring a cap authorizes spending up to the cap when the model confirms. With neither approval mechanism only previews are available.
 
+## Hosted connector (coming soon)
+
+Soon you will be able to add Reach Dog to Claude or ChatGPT without installing anything. Add `https://mcp.reach.dog/mcp` as a connector, sign in to your Reach Dog account, and set a daily limit for what the assistant may spend. You can revoke access at any time. Operator notes are in [docs/HOSTED.md](docs/HOSTED.md).
+
 ## Build from source
 
 Run `npm ci`, `npm run build`, and `npm pack` from this repository. To use a source build, configure the MCP command as `node` with the absolute path to `dist/server.js` as its argument. `npm test` runs the offline client and tool checks.
